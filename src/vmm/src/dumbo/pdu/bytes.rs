@@ -68,7 +68,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
-use utils::byte_order;
+use crate::utils::byte_order;
 
 /// Represents an immutable view into a sequence of bytes which stands for different values packed
 /// together using network byte ordering.
@@ -113,8 +113,8 @@ pub trait NetworkBytesMut: NetworkBytes + DerefMut<Target = [u8]> {
     ///
     /// # Panics
     ///
-    /// If `value` cannot be written into `self` at the given `offset` (e.g. if `offset > self.len()
-    /// - size_of::<u16>()`).
+    /// If `value` cannot be written into `self` at the given `offset`
+    /// (e.g. if `offset > self.len() - size_of::<u16>()`).
     #[inline]
     fn htons_unchecked(&mut self, offset: usize, value: u16) {
         assert!(offset <= self.len() - std::mem::size_of::<u16>());
@@ -125,8 +125,8 @@ pub trait NetworkBytesMut: NetworkBytes + DerefMut<Target = [u8]> {
     ///
     /// # Panics
     ///
-    /// If `value` cannot be written into `self` at the given `offset` (e.g. if `offset > self.len()
-    /// - size_of::<u32>()`).
+    /// If `value` cannot be written into `self` at the given `offset`
+    /// (e.g. if `offset > self.len() - size_of::<u32>()`).
     #[inline]
     fn htonl_unchecked(&mut self, offset: usize, value: u32) {
         assert!(offset <= self.len() - std::mem::size_of::<u32>());
@@ -134,20 +134,20 @@ pub trait NetworkBytesMut: NetworkBytes + DerefMut<Target = [u8]> {
     }
 }
 
-impl<'a> NetworkBytes for &'a [u8] {
+impl NetworkBytes for &[u8] {
     #[inline]
     fn shrink_unchecked(&mut self, len: usize) {
         *self = &self[..len];
     }
 }
-impl<'a> NetworkBytes for &'a mut [u8] {
+impl NetworkBytes for &mut [u8] {
     #[inline]
     fn shrink_unchecked(&mut self, len: usize) {
         *self = &mut std::mem::take(self)[..len];
     }
 }
 
-impl<'a> NetworkBytesMut for &'a mut [u8] {}
+impl NetworkBytesMut for &mut [u8] {}
 
 // This struct is used as a convenience for any type which contains a generic member implementing
 // NetworkBytes with a lifetime, so we don't have to also add the PhantomData member each time. We
@@ -158,7 +158,7 @@ pub(super) struct InnerBytes<'a, T: 'a> {
     phantom: PhantomData<&'a T>,
 }
 
-impl<'a, T: Debug> InnerBytes<'a, T> {
+impl<T: Debug> InnerBytes<'_, T> {
     /// Creates a new instance as a wrapper around `bytes`.
     #[inline]
     pub fn new(bytes: T) -> Self {
@@ -169,7 +169,7 @@ impl<'a, T: Debug> InnerBytes<'a, T> {
     }
 }
 
-impl<'a, T: Deref<Target = [u8]> + Debug> Deref for InnerBytes<'a, T> {
+impl<T: Deref<Target = [u8]> + Debug> Deref for InnerBytes<'_, T> {
     type Target = [u8];
 
     #[inline]
@@ -178,21 +178,21 @@ impl<'a, T: Deref<Target = [u8]> + Debug> Deref for InnerBytes<'a, T> {
     }
 }
 
-impl<'a, T: DerefMut<Target = [u8]> + Debug> DerefMut for InnerBytes<'a, T> {
+impl<T: DerefMut<Target = [u8]> + Debug> DerefMut for InnerBytes<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
         self.bytes.deref_mut()
     }
 }
 
-impl<'a, T: NetworkBytes + Debug> NetworkBytes for InnerBytes<'a, T> {
+impl<T: NetworkBytes + Debug> NetworkBytes for InnerBytes<'_, T> {
     #[inline]
     fn shrink_unchecked(&mut self, len: usize) {
         self.bytes.shrink_unchecked(len);
     }
 }
 
-impl<'a, T: NetworkBytesMut + Debug> NetworkBytesMut for InnerBytes<'a, T> {}
+impl<T: NetworkBytesMut + Debug> NetworkBytesMut for InnerBytes<'_, T> {}
 
 #[cfg(test)]
 mod tests {

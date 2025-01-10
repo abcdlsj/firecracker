@@ -10,10 +10,10 @@ use std::fmt::Debug;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize, Wrapping};
 
 use bitflags::bitflags;
-use utils::rand::xor_pseudo_rng_u32;
+use vmm_sys_util::rand::xor_pseudo_rng_u32;
 
 use crate::dumbo::pdu::bytes::NetworkBytes;
-use crate::dumbo::pdu::tcp::{Error as TcpSegmentError, Flags as TcpFlags, TcpSegment};
+use crate::dumbo::pdu::tcp::{Flags as TcpFlags, TcpError as TcpSegmentError, TcpSegment};
 use crate::dumbo::pdu::Incomplete;
 use crate::dumbo::tcp::{
     seq_after, seq_at_or_after, NextSegmentStatus, RstConfig, MAX_WINDOW_SIZE, MSS_DEFAULT,
@@ -82,7 +82,7 @@ bitflags! {
 pub type PayloadSource<'a, R> = Option<(&'a R, Wrapping<u32>)>;
 
 /// Describes errors which may occur during a passive open.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum PassiveOpenError {
     /// The incoming segment is not a valid `SYN`.
     InvalidSyn,
@@ -91,7 +91,7 @@ pub enum PassiveOpenError {
 }
 
 /// Describes errors which may occur when an existing connection receives a TCP segment.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum RecvError {
     /// The payload length is larger than the receive buffer size.
     BufferTooSmall,
@@ -100,23 +100,26 @@ pub enum RecvError {
 }
 
 /// Describes errors which may occur when a connection attempts to write a segment.
-#[derive(Debug, PartialEq, Eq, derive_more::From)]
+/// Needs `rustfmt::skip` to make multiline comments work
+#[rustfmt::skip]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum WriteNextError {
     /// The connection cannot write the segment because it has been previously reset.
     ConnectionReset,
     /// The write sends additional data after a `FIN` has been transmitted.
     DataAfterFin,
-    /// The remaining MSS (which can be reduced by IP and/or TCP options) is not large enough to
-    /// write the segment.
+    /** The remaining MSS (which can be reduced by IP and/or TCP options) is not large enough to \
+    write the segment. */
     MssRemaining,
-    /// The payload source specifies a buffer larger than [`MAX_WINDOW_SIZE`].
-    ///
-    /// [`MAX_WINDOW_SIZE`]: ../constant.MAX_WINDOW_SIZE.html
+    // The payload source specifies a buffer larger than [`MAX_WINDOW_SIZE`].
+    //
+    // [`MAX_WINDOW_SIZE`]: ../constant.MAX_WINDOW_SIZE.html
+    /// The payload source is too large.
     PayloadBufTooLarge,
     /// The payload source does not contain the first sequence number that should be sent.
     PayloadMissingSeq,
-    /// An error occurred during the actual write to the buffer.
-    TcpSegment(TcpSegmentError),
+    /// An error occurred during the actual write to the buffer: {0}
+    TcpSegment(#[from] TcpSegmentError),
 }
 
 /// Contains the state information and implements the logic for a minimalist TCP connection.
@@ -152,7 +155,7 @@ pub enum WriteNextError {
 /// user to supply an opaque `u64` timestamp value when invoking send or receive functionality. The
 /// timestamps must be non-decreasing, and are mainly used for retransmission timeouts.
 ///
-/// See https://github.com/firecracker-microvm/firecracker/blob/main/docs/mmds/mmds-design.md#dumbo
+/// See [mmds-design](https://github.com/firecracker-microvm/firecracker/blob/main/docs/mmds/mmds-design.md#dumbo)
 /// for why we are able to make these simplifications. Specifically, we want to stress that no
 /// traffic handled by dumbo ever leaves a microVM.
 ///
@@ -205,7 +208,7 @@ pub struct Connection {
 fn parse_mss_option<T: NetworkBytes + Debug>(
     segment: &TcpSegment<T>,
 ) -> Result<u16, PassiveOpenError> {
-    match segment.parse_mss_option_unchecked(segment.header_len()) {
+    match segment.parse_mss_option_unchecked(segment.header_len().into()) {
         Ok(Some(value)) => Ok(value.get()),
         Ok(None) => Ok(MSS_DEFAULT),
         Err(_) => Err(PassiveOpenError::MssOption),
@@ -348,11 +351,7 @@ impl Connection {
     fn local_rwnd(&self) -> u16 {
         let rwnd = (self.local_rwnd_edge - self.ack_to_send).0;
 
-        if rwnd > u32::from(u16::max_value()) {
-            u16::max_value()
-        } else {
-            rwnd as u16
-        }
+        u16::try_from(rwnd).unwrap_or(u16::MAX)
     }
 
     // Will actually become meaningful when/if we implement window scaling.
@@ -547,7 +546,7 @@ impl Connection {
             }
         }
 
-        let payload_len = s.len() - s.header_len();
+        let payload_len = s.len() - u16::from(s.header_len());
         let mut recv_status_flags = RecvStatusFlags::empty();
 
         if !self.synack_sent() {
@@ -646,9 +645,9 @@ impl Connection {
         }
 
         let seq = Wrapping(s.sequence_number());
-        let wrapping_payload_len = Wrapping(payload_len as u32);
+        let wrapping_payload_len = Wrapping(u32::from(payload_len));
 
-        if payload_len > buf.len() {
+        if usize::from(payload_len) > buf.len() {
             return Err(RecvError::BufferTooSmall);
         }
 
@@ -715,13 +714,9 @@ impl Connection {
 
             // We check this here because if a valid payload has been received, then we must have
             // set enqueue_ack = true earlier.
-            if payload_len > 0 {
-                buf[..payload_len].copy_from_slice(s.payload());
-                // The unwrap is safe because payload_len > 0.
-                return Ok((
-                    Some(NonZeroUsize::new(payload_len).unwrap()),
-                    recv_status_flags,
-                ));
+            if let Some(payload_len) = NonZeroUsize::new(payload_len.into()) {
+                buf[..payload_len.into()].copy_from_slice(s.payload());
+                return Ok((Some(payload_len), recv_status_flags));
             }
         }
 
@@ -820,7 +815,7 @@ impl Connection {
     /// * `mss_reserved` - How much (if anything) of the MSS value has been already used at the
     ///   lower layers (by IP options, for example). This will be zero most of the time.
     /// * `payload_src` - References a buffer which contains data to send, and also specifies the
-    ///   sequence number associated with the first byte from that that buffer.
+    ///   sequence number associated with the first byte from that buffer.
     /// * `now` - An opaque timestamp representing the current moment in time.
     ///
     /// [`MAX_WINDOW_SIZE`]: ../constant.MAX_WINDOW_SIZE.html
@@ -877,11 +872,12 @@ impl Connection {
         if let Some((read_buf, payload_seq)) = payload_src {
             // Limit the size of read_buf so it doesn't mess up later calculations (as usual, I take
             // the easy way out).
-            if read_buf.len() > MAX_WINDOW_SIZE as usize {
-                return Err(WriteNextError::PayloadBufTooLarge);
-            }
+            let len = match u32::try_from(read_buf.len()) {
+                Ok(len) if len <= MAX_WINDOW_SIZE => len,
+                _ => return Err(WriteNextError::PayloadBufTooLarge),
+            };
 
-            let payload_end = payload_seq + Wrapping(read_buf.len() as u32);
+            let payload_end = payload_seq + Wrapping(len);
 
             let mut rto_triggered = false;
 
@@ -961,8 +957,8 @@ impl Connection {
                 // either directly or via the RTO timer expiring.
                 self.dup_ack = false;
 
-                let payload_len = segment.inner().payload().len();
-                let mut first_seq_after = seq_to_send + Wrapping(payload_len as u32);
+                let payload_len = segment.inner().payload_len();
+                let mut first_seq_after = seq_to_send + Wrapping(u32::from(payload_len));
 
                 if let Some(fin_seq) = self.send_fin {
                     if first_seq_after == fin_seq {
@@ -1110,7 +1106,7 @@ pub(crate) mod tests {
             data_buf: &[u8],
         ) -> TcpSegment<'a, &'a mut [u8]> {
             let segment = self.write_segment_helper(buf, false, Some((data_buf, data_buf.len())));
-            assert_eq!(segment.payload_len(), data_buf.len());
+            assert_eq!(usize::from(segment.payload_len()), data_buf.len());
             segment
         }
 
@@ -1203,7 +1199,7 @@ pub(crate) mod tests {
         options_len: usize,
         flags_after_ns: TcpFlags,
     ) {
-        assert_eq!(s.len(), BASIC_SEGMENT_SIZE + options_len);
+        assert_eq!(usize::from(s.len()), BASIC_SEGMENT_SIZE + options_len);
         assert_eq!(s.flags_after_ns(), flags_after_ns);
     }
 
@@ -1471,13 +1467,13 @@ pub(crate) mod tests {
         assert_eq!(
             t.receive_segment(&mut c, &data).unwrap(),
             (
-                Some(NonZeroUsize::new(data.payload_len()).unwrap()),
+                Some(NonZeroUsize::new(data.payload_len().into()).unwrap()),
                 RecvStatusFlags::empty()
             )
         );
 
         // This is the ack number that should be set/sent.
-        let expected_ack = t.remote_isn.wrapping_add(data.payload_len() as u32 + 1);
+        let expected_ack = t.remote_isn.wrapping_add(u32::from(data.payload_len()) + 1);
 
         // Check that internal state gets updated properly.
         assert_eq!(c.ack_to_send.0, expected_ack);
@@ -1493,7 +1489,7 @@ pub(crate) mod tests {
         assert!(t.write_next_segment(&mut c, None).unwrap().is_none());
 
         {
-            let payload_len = data.payload_len() as u32;
+            let payload_len = u32::from(data.payload_len());
 
             // Assuming no one changed the code, the local window size of the connection was 10000,
             // so we should be able to successfully receive 9 more segments with 1000 byte payloads.
@@ -1504,7 +1500,7 @@ pub(crate) mod tests {
                 assert_eq!(
                     t.receive_segment(&mut c, &data).unwrap(),
                     (
-                        Some(NonZeroUsize::new(data.payload_len()).unwrap()),
+                        Some(NonZeroUsize::new(data.payload_len().into()).unwrap()),
                         RecvStatusFlags::empty()
                     )
                 );
@@ -1550,7 +1546,7 @@ pub(crate) mod tests {
         // The mss is 1100, and the remote window is 11000, so we can send 10 data packets.
         let max = 10;
         let remote_isn = t.remote_isn;
-        let mss = u32::from(t.mss);
+        let mss = t.mss;
 
         let (payload_buf, mut response_seq) = payload_src.unwrap();
         let mut payload_offset = 0;
@@ -1561,14 +1557,17 @@ pub(crate) mod tests {
                 .unwrap_or_else(|_| panic!("{}", i))
                 .unwrap_or_else(|| panic!("{}", i));
 
-            payload_offset += s.payload_len();
-            response_seq += Wrapping(s.payload_len() as u32);
+            payload_offset += usize::from(s.payload_len());
+            response_seq += Wrapping(u32::from(s.payload_len()));
 
             // Again, the 1 accounts for the sequence number taken up by the SYN.
-            assert_eq!(s.sequence_number(), conn_isn.wrapping_add(1 + i * mss));
+            assert_eq!(
+                s.sequence_number(),
+                conn_isn.wrapping_add(1 + i * u32::from(mss)),
+            );
             assert_eq!(s.ack_number(), remote_isn.wrapping_add(1));
             assert_eq!(s.flags_after_ns(), TcpFlags::ACK);
-            assert_eq!(s.payload_len() as u32, mss);
+            assert_eq!(s.payload_len(), mss);
         }
 
         // No more new data can be sent until the window advances, even though data_buf
@@ -1576,7 +1575,7 @@ pub(crate) mod tests {
         assert!(t.write_next_segment(&mut c, payload_src).unwrap().is_none());
 
         // Let's ACK the first segment previously sent.
-        ctrl.set_ack_number(conn_isn.wrapping_add(1 + mss))
+        ctrl.set_ack_number(conn_isn.wrapping_add(1 + u32::from(mss)))
             .set_flags_after_ns(TcpFlags::ACK);
         assert_eq!(
             t.receive_segment(&mut c, &ctrl).unwrap(),
@@ -1586,8 +1585,11 @@ pub(crate) mod tests {
         // We should be able to send one more segment now.
         {
             let s = t.write_next_segment(&mut c, payload_src).unwrap().unwrap();
-            assert_eq!(s.sequence_number(), conn_isn.wrapping_add(1 + max * mss));
-            assert_eq!(s.payload_len(), mss as usize);
+            assert_eq!(
+                s.sequence_number(),
+                conn_isn.wrapping_add(1 + max * u32::from(mss)),
+            );
+            assert_eq!(s.payload_len(), mss);
         }
         assert!(t.write_next_segment(&mut c, payload_src).unwrap().is_none());
 
@@ -1604,7 +1606,7 @@ pub(crate) mod tests {
         {
             let s = t.write_next_segment(&mut c, payload_src).unwrap().unwrap();
             assert_eq!(s.sequence_number(), ctrl.ack_number());
-            assert_eq!(s.payload_len(), mss as usize);
+            assert_eq!(s.payload_len(), mss);
         }
         assert!(t.write_next_segment(&mut c, payload_src).unwrap().is_none());
 
@@ -1613,7 +1615,7 @@ pub(crate) mod tests {
         {
             let s = t.write_next_segment(&mut c, payload_src).unwrap().unwrap();
             assert_eq!(s.sequence_number(), ctrl.ack_number());
-            assert_eq!(s.payload_len(), mss as usize);
+            assert_eq!(s.payload_len(), mss);
         }
         assert!(t.write_next_segment(&mut c, payload_src).unwrap().is_none());
 
@@ -1626,7 +1628,7 @@ pub(crate) mod tests {
         {
             let s = t.write_next_segment(&mut c, payload_src).unwrap().unwrap();
             assert_eq!(s.sequence_number(), ctrl.ack_number());
-            assert_eq!(s.payload_len(), mss as usize);
+            assert_eq!(s.payload_len(), mss);
         }
         assert!(t.write_next_segment(&mut c, payload_src).unwrap().is_none());
 
@@ -1775,7 +1777,7 @@ pub(crate) mod tests {
             check_control_segment(&s, 0, TcpFlags::FIN | TcpFlags::ACK);
             assert_eq!(
                 s.sequence_number(),
-                conn_isn.wrapping_add(1 + bytes_sent_by_c as u32)
+                conn_isn.wrapping_add(1 + u32::try_from(bytes_sent_by_c).unwrap())
             );
         }
 

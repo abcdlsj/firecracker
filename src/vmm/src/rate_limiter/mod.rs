@@ -1,8 +1,6 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(missing_docs)]
-
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 use std::{fmt, io};
@@ -11,10 +9,10 @@ use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 
 pub mod persist;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 /// Describes the errors that may occur while handling rate limiter events.
-pub enum Error {
-    /// The event handler was called spuriously.
+pub enum RateLimiterError {
+    /// The event handler was called spuriously: {0}
     SpuriousRateLimiterEvent(&'static str),
 }
 
@@ -26,6 +24,12 @@ const TIMER_REFILL_STATE: TimerState =
 const NANOSEC_IN_ONE_MILLISEC: u64 = 1_000_000;
 
 // Euclid's two-thousand-year-old algorithm for finding the greatest common divisor.
+#[cfg_attr(kani, kani::requires(x > 0 && y > 0))]
+#[cfg_attr(kani, kani::ensures(
+    |&result| result != 0
+        && x % result == 0
+        && y % result == 0
+))]
 fn gcd(x: u64, y: u64) -> u64 {
     let mut x = x;
     let mut y = y;
@@ -116,6 +120,7 @@ impl TokenBucket {
     }
 
     // Replenishes token bucket based on elapsed time. Should only be called internally by `Self`.
+    #[allow(clippy::cast_possible_truncation)]
     fn auto_replenish(&mut self) {
         // Compute time passed since last refill/update.
         let now = Instant::now();
@@ -323,15 +328,15 @@ impl RateLimiter {
     /// # Arguments
     ///
     /// * `bytes_total_capacity` - the total capacity of the `TokenType::Bytes` token bucket.
-    /// * `bytes_one_time_burst` - initial extra credit on top of `bytes_total_capacity`,
-    /// that does not replenish and which can be used for an initial burst of data.
-    /// * `bytes_complete_refill_time_ms` - number of milliseconds for the `TokenType::Bytes`
-    /// token bucket to go from zero Bytes to `bytes_total_capacity` Bytes.
+    /// * `bytes_one_time_burst` - initial extra credit on top of `bytes_total_capacity`, that does
+    ///   not replenish and which can be used for an initial burst of data.
+    /// * `bytes_complete_refill_time_ms` - number of milliseconds for the `TokenType::Bytes` token
+    ///   bucket to go from zero Bytes to `bytes_total_capacity` Bytes.
     /// * `ops_total_capacity` - the total capacity of the `TokenType::Ops` token bucket.
-    /// * `ops_one_time_burst` - initial extra credit on top of `ops_total_capacity`,
-    /// that does not replenish and which can be used for an initial burst of data.
+    /// * `ops_one_time_burst` - initial extra credit on top of `ops_total_capacity`, that does not
+    ///   replenish and which can be used for an initial burst of data.
     /// * `ops_complete_refill_time_ms` - number of milliseconds for the `TokenType::Ops` token
-    /// bucket to go from zero Ops to `ops_total_capacity` Ops.
+    ///   bucket to go from zero Ops to `ops_total_capacity` Ops.
     ///
     /// If either bytes/ops *size* or *refill_time* are **zero**, the limiter
     /// is **disabled** for that respective token type.
@@ -417,7 +422,8 @@ impl RateLimiter {
                     // order to enforce the bandwidth limit we need to prevent
                     // further calls to the rate limiter for
                     // `ratio * refill_time` milliseconds.
-                    #[allow(clippy::cast_sign_loss)] // ratio is always positive
+                    // The conversion should be safe because the ratio is positive.
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                     self.activate_timer(TimerState::Oneshot(Duration::from_millis(
                         (ratio * refill_time as f64) as u64,
                     )));
@@ -462,9 +468,9 @@ impl RateLimiter {
     /// # Errors
     ///
     /// If the rate limiter is disabled or is not blocked, an error is returned.
-    pub fn event_handler(&mut self) -> Result<(), Error> {
+    pub fn event_handler(&mut self) -> Result<(), RateLimiterError> {
         match self.timer_fd.read() {
-            0 => Err(Error::SpuriousRateLimiterEvent(
+            0 => Err(RateLimiterError::SpuriousRateLimiterEvent(
                 "Rate limiter event handler called without a present timer",
             )),
             _ => {
@@ -598,20 +604,6 @@ mod verification {
             unsafe { std::mem::transmute(stub) }
         }
 
-        /// Stubs out the GCD computation by over-approximating the return value as "any number that
-        /// divides both inputs".
-        fn gcd(x: u64, y: u64) -> u64 {
-            if x == 0 && y == 0 {
-                0
-            } else {
-                kani::any_where(|&z| z != 0 && x % z == 0 && y % z == 0)
-            }
-
-            // NOTE: if we can figure out how to express "for all w. (...) => (...)", then we can
-            // use a logical definition of GCD as a stub that neither over- nor
-            // underapproximates.
-        }
-
         /// Stubs out `TokenBucket::auto_replenish` by simply filling up the bucket by a
         /// non-deterministic amount.
         fn token_bucket_auto_replenish(this: &mut TokenBucket) {
@@ -659,24 +651,19 @@ mod verification {
     }
 
     // Euclid algorithm has runtime O(log(min(x,y))) -> kani::unwind(log(MAX)) should be enough.
-    #[kani::proof]
+    #[kani::proof_for_contract(gcd)]
     #[kani::unwind(64)]
     #[kani::solver(cadical)]
-    fn verify_gcd() {
+    fn gcd_contract_harness() {
         const MAX: u64 = 64;
-
         let x = kani::any_where(|&x| x < MAX);
         let y = kani::any_where(|&y| y < MAX);
         let gcd = super::gcd(x, y);
-
-        if gcd == 0 {
-            assert!(x == 0 && y == 0);
-        } else {
-            assert!(x % gcd == 0);
-            assert!(y % gcd == 0);
-
-            // Definition of gcd: gcd(x,y) = z iff z|x and z|y and for all w. w|x and w|y => w|z
-            // final condition can be rephrased as w <= z in the special case of u64 \ {0}.
+        // Most assertions are unnecessary as they are proved as part of the
+        // contract. However for simplification the contract only enforces that
+        // the result is *a* divisor, not necessarily the smallest one, so we
+        // check that here manually.
+        if gcd != 0 {
             let w = kani::any_where(|&w| w > 0 && x % w == 0 && y % w == 0);
             assert!(gcd >= w);
         }
@@ -684,7 +671,7 @@ mod verification {
 
     #[kani::proof]
     #[kani::stub(std::time::Instant::now, stubs::instant_now)]
-    #[kani::stub(gcd, stubs::gcd)]
+    #[kani::stub_verified(gcd)]
     #[kani::solver(cadical)]
     fn verify_token_bucket_new() {
         let size = kani::any();
@@ -705,7 +692,7 @@ mod verification {
     #[kani::proof]
     #[kani::unwind(1)] // enough to unwind the recursion at `Timespec::sub_timespec`
     #[kani::stub(std::time::Instant::now, stubs::instant_now)]
-    #[kani::stub(gcd, stubs::gcd)]
+    #[kani::stub_verified(gcd)]
     fn verify_token_bucket_auto_replenish() {
         const MAX_BUCKET_SIZE: u64 = 15;
         const MAX_REFILL_TIME: u64 = 15;
@@ -727,7 +714,7 @@ mod verification {
     #[kani::proof]
     #[kani::stub(std::time::Instant::now, stubs::instant_now)]
     #[kani::stub(TokenBucket::auto_replenish, stubs::token_bucket_auto_replenish)]
-    #[kani::stub(gcd, stubs::gcd)]
+    #[kani::stub_verified(gcd)]
     #[kani::solver(cadical)]
     fn verify_token_bucket_reduce() {
         let mut token_bucket: TokenBucket = kani::any();
@@ -761,7 +748,7 @@ mod verification {
 
     #[kani::proof]
     #[kani::stub(std::time::Instant::now, stubs::instant_now)]
-    #[kani::stub(gcd, stubs::gcd)]
+    #[kani::stub_verified(gcd)]
     #[kani::stub(TokenBucket::auto_replenish, stubs::token_bucket_auto_replenish)]
     fn verify_token_bucket_force_replenish() {
         let mut token_bucket: TokenBucket = kani::any();
@@ -807,7 +794,7 @@ pub(crate) mod tests {
         }
 
         // After a restore, we cannot be certain that the last_update field has the same value.
-        pub fn partial_eq(&self, other: &TokenBucket) -> bool {
+        pub(crate) fn partial_eq(&self, other: &TokenBucket) -> bool {
             (other.capacity() == self.capacity())
                 && (other.one_time_burst() == self.one_time_burst())
                 && (other.refill_time_ms() == self.refill_time_ms())
@@ -953,10 +940,10 @@ pub(crate) mod tests {
         // limiter should not be blocked
         assert!(!l.is_blocked());
         // limiter should be disabled so consume(whatever) should work
-        assert!(l.consume(u64::max_value(), TokenType::Ops));
-        assert!(l.consume(u64::max_value(), TokenType::Bytes));
+        assert!(l.consume(u64::MAX, TokenType::Ops));
+        assert!(l.consume(u64::MAX, TokenType::Bytes));
         // calling the handler without there having been an event should error
-        assert!(l.event_handler().is_err());
+        l.event_handler().unwrap_err();
         assert_eq!(
             format!("{:?}", l.event_handler().err().unwrap()),
             "SpuriousRateLimiterEvent(\"Rate limiter event handler called without a present \
@@ -1013,7 +1000,7 @@ pub(crate) mod tests {
         assert!(l.as_raw_fd() > 0);
 
         // ops/s limiter should be disabled so consume(whatever) should work
-        assert!(l.consume(u64::max_value(), TokenType::Ops));
+        assert!(l.consume(u64::MAX, TokenType::Ops));
 
         // do full 1000 bytes
         assert!(l.consume(1000, TokenType::Bytes));
@@ -1028,7 +1015,7 @@ pub(crate) mod tests {
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
         // the timer_fd should have an event on it by now
-        assert!(l.event_handler().is_ok());
+        l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
         // try and succeed on another 100 bytes this time
@@ -1046,7 +1033,7 @@ pub(crate) mod tests {
         assert!(l.as_raw_fd() > 0);
 
         // bytes/s limiter should be disabled so consume(whatever) should work
-        assert!(l.consume(u64::max_value(), TokenType::Bytes));
+        assert!(l.consume(u64::MAX, TokenType::Bytes));
 
         // do full 1000 ops
         assert!(l.consume(1000, TokenType::Ops));
@@ -1061,7 +1048,7 @@ pub(crate) mod tests {
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
         // the timer_fd should have an event on it by now
-        assert!(l.event_handler().is_ok());
+        l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
         // try and succeed on another 100 ops this time
@@ -1095,7 +1082,7 @@ pub(crate) mod tests {
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
         // the timer_fd should have an event on it by now
-        assert!(l.event_handler().is_ok());
+        l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
         // try and succeed on another 100 ops this time
@@ -1116,13 +1103,13 @@ pub(crate) mod tests {
         // check that even after a whole second passes, the rate limiter
         // is still blocked
         thread::sleep(Duration::from_millis(1000));
-        assert!(l.event_handler().is_err());
+        l.event_handler().unwrap_err();
         assert!(l.is_blocked());
 
         // after 1.5x the replenish time has passed, the rate limiter
         // is available again
         thread::sleep(Duration::from_millis(500));
-        assert!(l.event_handler().is_ok());
+        l.event_handler().unwrap();
         assert!(!l.is_blocked());
 
         // reset the rate limiter
@@ -1136,27 +1123,27 @@ pub(crate) mod tests {
         // check that after more than the minimum refill time,
         // the rate limiter is still blocked
         thread::sleep(Duration::from_millis(200));
-        assert!(l.event_handler().is_err());
+        l.event_handler().unwrap_err();
         assert!(l.is_blocked());
 
         // try to consume some tokens, which should fail as the timer
         // is still active
         assert!(!l.consume(100, TokenType::Bytes));
-        assert!(l.event_handler().is_err());
+        l.event_handler().unwrap_err();
         assert!(l.is_blocked());
 
         // check that after the minimum refill time, the timer was not
         // overwritten and the rate limiter is still blocked from the
         // borrowing we performed earlier
         thread::sleep(Duration::from_millis(100));
-        assert!(l.event_handler().is_err());
+        l.event_handler().unwrap_err();
         assert!(l.is_blocked());
         assert!(!l.consume(100, TokenType::Bytes));
 
         // after waiting out the full duration, rate limiter should be
         // availale again
         thread::sleep(Duration::from_millis(200));
-        assert!(l.event_handler().is_ok());
+        l.event_handler().unwrap();
         assert!(!l.is_blocked());
         assert!(l.consume(100, TokenType::Bytes));
     }

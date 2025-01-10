@@ -7,7 +7,7 @@ import shutil
 import stat
 from pathlib import Path
 
-from retry.api import retry_call
+from tenacity import Retrying, retry_if_exception_type, stop_after_delay
 
 from framework import defs, utils
 from framework.defs import FC_BINARY_NAME
@@ -30,7 +30,6 @@ class JailerContext:
     uid = None
     gid = None
     chroot_base = None
-    netns = None
     daemonize = None
     new_pid_ns = None
     extra_args = None
@@ -67,16 +66,17 @@ class JailerContext:
         self.exec_file = exec_file
         self.uid = uid
         self.gid = gid
-        self.chroot_base = chroot_base
-        self.netns = netns if netns is not None else jailer_id
+        self.chroot_base = Path(chroot_base)
+        self.netns = netns
         self.daemonize = daemonize
         self.new_pid_ns = new_pid_ns
         self.extra_args = extra_args
         self.api_socket_name = DEFAULT_USOCKET_NAME
-        self.cgroups = cgroups
+        self.cgroups = cgroups or []
         self.resource_limits = resource_limits
         self.cgroup_ver = cgroup_ver
         self.parent_cgroup = parent_cgroup
+        assert chroot_base is not None
 
     # Disabling 'too-many-branches' warning for this function as it needs to
     # check every argument, so the number of branches will increase
@@ -103,7 +103,7 @@ class JailerContext:
         if self.chroot_base is not None:
             jailer_param_list.extend(["--chroot-base-dir", str(self.chroot_base)])
         if self.netns is not None:
-            jailer_param_list.extend(["--netns", str(self.netns_file_path())])
+            jailer_param_list.extend(["--netns", str(self.netns.path)])
         if self.daemonize:
             jailer_param_list.append("--daemonize")
         if self.new_pid_ns:
@@ -112,7 +112,7 @@ class JailerContext:
             jailer_param_list.extend(["--parent-cgroup", str(self.parent_cgroup)])
         if self.cgroup_ver:
             jailer_param_list.extend(["--cgroup-version", str(self.cgroup_ver)])
-        if self.cgroups is not None:
+        if self.cgroups:
             for cgroup in self.cgroups:
                 jailer_param_list.extend(["--cgroup", str(cgroup)])
         if self.resource_limits is not None:
@@ -133,11 +133,7 @@ class JailerContext:
 
     def chroot_base_with_id(self):
         """Return the MicroVM chroot base + MicroVM ID."""
-        return os.path.join(
-            self.chroot_base if self.chroot_base is not None else DEFAULT_CHROOT_PATH,
-            Path(self.exec_file).name,
-            self.jailer_id,
-        )
+        return self.chroot_base / Path(self.exec_file).name / self.jailer_id
 
     def api_socket_path(self):
         """Return the MicroVM API socket path."""
@@ -177,38 +173,12 @@ class JailerContext:
             os.chown(global_p, self.uid, self.gid)
         return str(jailed_p)
 
-    def netns_file_path(self):
-        """Get the host netns file path for a jailer context.
-
-        Returns the path on the host to the file which represents the netns,
-        and which must be passed to the jailer as the value of the --netns
-        parameter, when in use.
-        """
-        if self.netns:
-            return "/var/run/netns/{}".format(self.netns)
-        return None
-
-    def netns_cmd_prefix(self):
-        """Return the jailer context netns file prefix."""
-        if self.netns:
-            return "ip netns exec {} ".format(self.netns)
-        return ""
-
     def setup(self):
         """Set up this jailer context."""
-        os.makedirs(
-            self.chroot_base if self.chroot_base is not None else DEFAULT_CHROOT_PATH,
-            exist_ok=True,
-        )
-
-        if self.netns and self.netns not in utils.run_cmd("ip netns list")[1]:
-            utils.run_cmd("ip netns add {}".format(self.netns))
+        os.makedirs(self.chroot_base, exist_ok=True)
 
     def cleanup(self):
         """Clean up this jailer context."""
-        # pylint: disable=subprocess-run-check
-        if self.netns and os.path.exists("/var/run/netns/{}".format(self.netns)):
-            utils.run_cmd("ip netns del {}".format(self.netns))
 
         # Remove the cgroup folders associated with this microvm.
         # The base /sys/fs/cgroup/<controller>/firecracker folder will remain,
@@ -226,13 +196,13 @@ class JailerContext:
                 # Obtain the tasks from each cgroup and wait on them before
                 # removing the microvm's associated cgroup folder.
                 try:
-                    retry_call(
-                        f=self._kill_cgroup_tasks,
-                        fargs=[controller],
-                        exceptions=TimeoutError,
-                        max_delay=5,
-                        logger=None,
-                    )
+                    for attempt in Retrying(
+                        retry=retry_if_exception_type(TimeoutError),
+                        stop=stop_after_delay(5),
+                        reraise=True,
+                    ):
+                        with attempt:
+                            self._kill_cgroup_tasks(controller)
                 except TimeoutError:
                     pass
 
@@ -244,7 +214,7 @@ class JailerContext:
                 # We do not need to know if it succeeded or not; afterall,
                 # we are trying to clean up resources created by the jailer
                 # itself not the testing system.
-                utils.run_cmd(cmd, ignore_return_code=True)
+                utils.run_cmd(cmd)
 
     def _kill_cgroup_tasks(self, controller):
         """Simulate wait on pid.
@@ -264,10 +234,15 @@ class JailerContext:
             return True
 
         cmd = "cat {}".format(tasks_file)
-        result = utils.run_cmd(cmd)
+        result = utils.check_output(cmd)
 
         tasks_split = result.stdout.splitlines()
         for task in tasks_split:
             if os.path.exists("/proc/{}".format(task)):
                 raise TimeoutError
         return True
+
+    @property
+    def pid_file(self):
+        """Return the PID file of the jailed process"""
+        return Path(self.chroot_path()) / (self.exec_file.name + ".pid")

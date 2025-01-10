@@ -5,14 +5,19 @@
 
 pub mod device;
 mod event_handler;
+pub mod metrics;
 pub mod persist;
 pub mod test_utils;
 mod util;
 
-use utils::vm_memory::GuestMemoryError;
+use log::error;
+use vm_memory::GuestMemoryError;
 
 pub use self::device::{Balloon, BalloonConfig, BalloonStats};
-use crate::devices::virtio::FIRECRACKER_MAX_QUEUE_SIZE;
+use super::queue::QueueError;
+use crate::devices::virtio::balloon::metrics::METRICS;
+use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
+use crate::logger::IncMetric;
 
 /// Device ID used in MMIO device identification.
 /// Because Balloon is unique per-vm, this ID can be hardcoded.
@@ -61,19 +66,19 @@ const VIRTIO_BALLOON_S_HTLB_PGALLOC: u16 = 8;
 const VIRTIO_BALLOON_S_HTLB_PGFAIL: u16 = 9;
 
 /// Balloon device related errors.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum BalloonError {
-    /// Activation error.
+    /// Activation error: {0}
     Activate(super::ActivateError),
     /// No balloon device found.
     DeviceNotFound,
     /// Device not activated yet.
     DeviceNotActive,
-    /// EventFd error.
+    /// EventFd error: {0}
     EventFd(std::io::Error),
-    /// Guest gave us bad memory addresses.
+    /// Guest gave us bad memory addresses: {0}
     GuestMemory(GuestMemoryError),
-    /// Received error while sending an interrupt.
+    /// Received error while sending an interrupt: {0}
     InterruptError(std::io::Error),
     /// Guest gave us a malformed descriptor.
     MalformedDescriptor,
@@ -87,19 +92,29 @@ pub enum BalloonError {
     StatisticsStateChange,
     /// Amount of pages requested cannot fit in `u32`.
     TooManyPagesRequested,
-    /// Error while processing the virt queues.
-    Queue(super::QueueError),
-    /// Error removing a memory region at inflate time.
+    /// Error while processing the virt queues: {0}
+    Queue(QueueError),
+    /// Error removing a memory region at inflate time: {0}
     RemoveMemoryRegion(RemoveRegionError),
-    /// Error creating the statistics timer.
+    /// Error creating the statistics timer: {0}
     Timer(std::io::Error),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum RemoveRegionError {
+    /// Address translation error.
     AddressTranslation,
+    /// Malformed guest address range.
     MalformedRange,
+    /// Error calling madvise: {0}
     MadviseFail(std::io::Error),
+    /// Error calling mmap: {0}
     MmapFail(std::io::Error),
+    /// Region not found.
     RegionNotFound,
+}
+
+pub(super) fn report_balloon_event_fail(err: BalloonError) {
+    error!("{:?}", err);
+    METRICS.event_fails.inc();
 }

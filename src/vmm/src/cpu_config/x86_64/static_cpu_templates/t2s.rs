@@ -13,8 +13,8 @@ use crate::cpu_config::x86_64::custom_cpu_template::{
 /// migrating snapshots between hosts with Intel Skylake and Cascade Lake securely.
 ///
 /// Reference:
-/// - Intel SDM: https://cdrdv2.intel.com/v1/dl/getContent/671200
-/// - CPUID Enumeration and Architectural MSRs: https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/cpuid-enumeration-and-architectural-msrs.html
+/// - Intel SDM: <https://cdrdv2.intel.com/v1/dl/getContent/671200>
+/// - CPUID Enumeration and Architectural MSRs: <https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/cpuid-enumeration-and-architectural-msrs.html>
 #[allow(clippy::unusual_byte_groupings)]
 pub fn t2s() -> CustomCpuTemplate {
     CustomCpuTemplate {
@@ -255,12 +255,13 @@ pub fn t2s() -> CustomCpuTemplate {
             // - Bit 23: OVERCLOCKING_STATUS
             // - Bit 24: PBRSB_NO
             // - Bit 26: GDS_NO
+            // - BIT 27: RFDS_NO
             // - Bits 63-25: Reserved
             RegisterModifier {
             addr: 0x10a,
             bitmap: RegisterValueFilter {
                 filter: 0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111,
-                value: 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0100_0000_1000_0000_1100_0100_1100,
+                value: 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_1100_0000_1000_0000_1100_0100_1100,
             },
         }],
         ..Default::default()

@@ -5,14 +5,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::mem::offset_of;
 use std::path::PathBuf;
 
 use kvm_bindings::*;
 use kvm_ioctls::VcpuFd;
-use utils::vm_memory::GuestMemoryMmap;
 
 use super::get_fdt_addr;
 use super::regs::*;
+use crate::vstate::memory::GuestMemoryMmap;
 
 /// Errors thrown while setting aarch64 registers.
 #[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
@@ -27,8 +28,8 @@ pub enum VcpuError {
     GetMp(kvm_ioctls::Error),
     /// Failed to set multiprocessor state: {0}
     SetMp(kvm_ioctls::Error),
-    /// Failed FamStructWrapper operation: {0:?}
-    Fam(utils::fam::Error),
+    /// Failed FamStructWrapper operation: {0}
+    Fam(vmm_sys_util::fam::Error),
     /// {0}
     GetMidrEl1(String),
 }
@@ -42,7 +43,7 @@ pub enum VcpuError {
 pub fn get_manufacturer_id_from_state(regs: &Aarch64RegisterVec) -> Result<u32, VcpuError> {
     let midr_el1 = regs.iter().find(|reg| reg.id == MIDR_EL1);
     match midr_el1 {
-        Some(register) => Ok(register.value::<u64, 8>() as u32 >> 24),
+        Some(register) => Ok(((register.value::<u64, 8>() >> 24) & 0xFF) as u32),
         None => Err(VcpuError::GetMidrEl1(
             "Failed to find MIDR_EL1 in vCPU state!".to_string(),
         )),
@@ -78,10 +79,10 @@ pub fn setup_boot_regs(
     boot_ip: u64,
     mem: &GuestMemoryMmap,
 ) -> Result<(), VcpuError> {
-    let kreg_off = offset__of!(kvm_regs, regs);
+    let kreg_off = offset_of!(kvm_regs, regs);
 
     // Get the register index of the PSTATE (Processor State) register.
-    let pstate = offset__of!(user_pt_regs, pstate) + kreg_off;
+    let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
     let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
     vcpufd
         .set_one_reg(id, &PSTATE_FAULT_BITS_64.to_le_bytes())
@@ -90,7 +91,7 @@ pub fn setup_boot_regs(
     // Other vCPUs are powered off initially awaiting PSCI wakeup.
     if cpu_id == 0 {
         // Setting the PC (Processor Counter) to the current program address (kernel address).
-        let pc = offset__of!(user_pt_regs, pc) + kreg_off;
+        let pc = offset_of!(user_pt_regs, pc) + kreg_off;
         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pc);
         vcpufd
             .set_one_reg(id, &boot_ip.to_le_bytes())
@@ -100,7 +101,7 @@ pub fn setup_boot_regs(
         // "The device tree blob (dtb) must be placed on an 8-byte boundary and must
         // not exceed 2 megabytes in size." -> https://www.kernel.org/doc/Documentation/arm64/booting.txt.
         // We are choosing to place it the end of DRAM. See `get_fdt_addr`.
-        let regs0 = offset__of!(user_pt_regs, regs) + kreg_off;
+        let regs0 = offset_of!(user_pt_regs, regs) + kreg_off;
         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, regs0);
         vcpufd
             .set_one_reg(id, &get_fdt_addr(mem).to_le_bytes())
@@ -153,25 +154,41 @@ pub fn get_registers(
 /// Returns all registers ids, including core and system
 pub fn get_all_registers_ids(vcpufd: &VcpuFd) -> Result<Vec<u64>, VcpuError> {
     // Call KVM_GET_REG_LIST to get all registers available to the guest. For ArmV8 there are
-    // less than 500 registers.
+    // less than 500 registers expected, resize to the reported size when necessary.
     let mut reg_list = RegList::new(500).map_err(VcpuError::Fam)?;
-    vcpufd
-        .get_reg_list(&mut reg_list)
-        .map_err(VcpuError::GetRegList)?;
-    Ok(reg_list.as_slice().to_vec())
+
+    match vcpufd.get_reg_list(&mut reg_list) {
+        Ok(_) => Ok(reg_list.as_slice().to_vec()),
+        Err(e) => match e.errno() {
+            libc::E2BIG => {
+                // resize and retry.
+                let size: usize = reg_list
+                    .as_fam_struct_ref()
+                    .n
+                    .try_into()
+                    // Safe to unwrap as Firecracker only targets 64-bit machines.
+                    .unwrap();
+                reg_list = RegList::new(size).map_err(VcpuError::Fam)?;
+                vcpufd
+                    .get_reg_list(&mut reg_list)
+                    .map_err(VcpuError::GetRegList)?;
+
+                Ok(reg_list.as_slice().to_vec())
+            }
+            _ => Err(VcpuError::GetRegList(e)),
+        },
+    }
 }
 
-/// Set the state of the system registers.
+/// Set the state of one system register.
 ///
 /// # Arguments
 ///
-/// * `regs` - Slice of registers to be set.
-pub fn set_registers(vcpufd: &VcpuFd, regs: &Aarch64RegisterVec) -> Result<(), VcpuError> {
-    for reg in regs.iter() {
-        vcpufd
-            .set_one_reg(reg.id, reg.as_slice())
-            .map_err(|e| VcpuError::SetOneReg(reg.id, e))?;
-    }
+/// * `reg` - Register to be set.
+pub fn set_register(vcpufd: &VcpuFd, reg: Aarch64RegisterRef) -> Result<(), VcpuError> {
+    vcpufd
+        .set_one_reg(reg.id, reg.as_slice())
+        .map_err(|e| VcpuError::SetOneReg(reg.id, e))?;
     Ok(())
 }
 
@@ -200,16 +217,15 @@ mod tests {
     use kvm_ioctls::Kvm;
 
     use super::*;
-    use crate::arch::aarch64::{arch_memory_regions, layout};
+    use crate::arch::aarch64::layout;
+    use crate::test_utils::arch_mem;
 
     #[test]
     fn test_setup_regs() {
         let kvm = Kvm::new().unwrap();
         let vm = kvm.create_vm().unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
-        let regions = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000);
-        let mem = utils::vm_memory::test_utils::create_anon_guest_memory(&regions, false)
-            .expect("Cannot initialize memory");
+        let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
 
         let res = setup_boot_regs(&vcpu, 0, 0x0, &mem);
         assert!(matches!(
@@ -221,7 +237,7 @@ mod tests {
         vm.get_preferred_target(&mut kvi).unwrap();
         vcpu.vcpu_init(&kvi).unwrap();
 
-        assert!(setup_boot_regs(&vcpu, 0, 0x0, &mem).is_ok());
+        setup_boot_regs(&vcpu, 0, 0x0, &mem).unwrap();
     }
 
     #[test]
@@ -258,7 +274,9 @@ mod tests {
 
         vcpu.vcpu_init(&kvi).unwrap();
         get_all_registers(&vcpu, &mut regs).unwrap();
-        set_registers(&vcpu, &regs).unwrap();
+        for reg in regs.iter() {
+            set_register(&vcpu, reg).unwrap();
+        }
     }
 
     #[test]
@@ -272,15 +290,17 @@ mod tests {
         vm.get_preferred_target(&mut kvi).unwrap();
 
         let res = get_mpstate(&vcpu);
-        assert!(res.is_ok());
-        assert!(set_mpstate(&vcpu, res.unwrap()).is_ok());
+        set_mpstate(&vcpu, res.unwrap()).unwrap();
 
         unsafe { libc::close(vcpu.as_raw_fd()) };
 
         let res = get_mpstate(&vcpu);
-        assert!(matches!(res.unwrap_err(), VcpuError::GetMp(_)));
+        assert!(matches!(res, Err(VcpuError::GetMp(_))), "{:?}", res);
 
         let res = set_mpstate(&vcpu, kvm_mp_state::default());
-        assert!(matches!(res.unwrap_err(), VcpuError::SetMp(_)));
+        assert!(matches!(res, Err(VcpuError::SetMp(_))), "{:?}", res);
+
+        // dropping vcpu would double close the fd, so leak it
+        std::mem::forget(vcpu);
     }
 }

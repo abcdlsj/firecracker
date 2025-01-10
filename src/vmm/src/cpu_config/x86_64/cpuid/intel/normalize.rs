@@ -9,7 +9,7 @@ use crate::cpu_config::x86_64::cpuid::{
     BRAND_STRING_LENGTH,
 };
 
-/// Error type for [`IntelCpuid::normalize`].
+/// Error type for [`super::IntelCpuid::normalize`].
 #[derive(Debug, thiserror::Error, displaydoc::Display, Eq, PartialEq)]
 pub enum NormalizeCpuidError {
     /// Failed to set deterministic cache leaf: {0}
@@ -26,7 +26,7 @@ pub enum NormalizeCpuidError {
     ApplyBrandString(MissingBrandStringLeaves),
 }
 
-/// Error type for setting leaf 4 section of `IntelCpuid::normalize`.
+/// Error type for setting leaf 4 section of [`super::IntelCpuid::normalize`].
 // `displaydoc::Display` does not support multi-line comments, `rustfmt` will format these comments
 // across multiple lines, so we skip formatting here. This can be removed when
 // https://github.com/yaahc/displaydoc/issues/44 is resolved.
@@ -227,7 +227,7 @@ impl super::IntelCpuid {
     }
 }
 
-/// Error type for [`IntelCpuid::default_brand_string`].
+/// Error type for [`default_brand_string`].
 #[derive(Debug, Eq, PartialEq, thiserror::Error, displaydoc::Display)]
 pub enum DefaultBrandStringError {
     /// Missing frequency: {0:?}.
@@ -252,11 +252,7 @@ pub enum DefaultBrandStringError {
 // As we pass through host frequency, we require CPUID and thus `cfg(cpuid)`.
 // TODO: Use `split_array_ref`
 // (https://github.com/firecracker-microvm/firecracker/issues/3347)
-#[allow(
-    clippy::indexing_slicing,
-    clippy::integer_arithmetic,
-    clippy::arithmetic_side_effects
-)]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #[inline]
 fn default_brand_string(
     // Host brand string.
@@ -339,6 +335,8 @@ mod tests {
         clippy::as_conversions
     )]
 
+    use std::ffi::CStr;
+
     use super::*;
     #[test]
     fn default_brand_string_test() {
@@ -369,11 +367,9 @@ mod tests {
             result,
             Err(DefaultBrandStringError::Overflow),
             "{:?}",
-            result.as_ref().map(|s| unsafe {
-                std::ffi::CStr::from_ptr((s as *const u8).cast())
-                    .to_str()
-                    .unwrap()
-            }),
+            result
+                .as_ref()
+                .map(|s| CStr::from_bytes_until_nul(s).unwrap()),
         );
     }
 

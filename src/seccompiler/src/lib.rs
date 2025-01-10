@@ -1,7 +1,7 @@
 // Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 
 //! The library crate that defines common helper functions that are generally used in
 //! conjunction with seccompiler-bin.
@@ -89,7 +89,9 @@ pub fn apply_filter(bpf_filter: BpfProgramRef) -> std::result::Result<(), Instal
 
     // If the program length is greater than the limit allowed by the kernel,
     // fail quickly. Otherwise, `prctl` will give a more cryptic error code.
-    if bpf_filter.len() > BPF_MAX_LEN {
+    let bpf_filter_len =
+        u16::try_from(bpf_filter.len()).map_err(|_| InstallationError::FilterTooLarge)?;
+    if bpf_filter_len > BPF_MAX_LEN {
         return Err(InstallationError::FilterTooLarge);
     }
 
@@ -103,7 +105,7 @@ pub fn apply_filter(bpf_filter: BpfProgramRef) -> std::result::Result<(), Instal
         }
 
         let bpf_prog = sock_fprog {
-            len: bpf_filter.len() as u16,
+            len: bpf_filter_len,
             filter: bpf_filter.as_ptr(),
         };
         let bpf_prog_ptr = &bpf_prog as *const sock_fprog;
@@ -138,7 +140,7 @@ mod tests {
         // Malformed bincode binary.
         {
             let data = "adassafvc".to_string();
-            assert!(deserialize_binary(data.as_bytes(), None).is_err());
+            deserialize_binary(data.as_bytes(), None).unwrap_err();
         }
 
         // Test that the binary deserialization is correct, and that the thread keys

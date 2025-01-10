@@ -21,8 +21,6 @@ while still preventing the latter: We run cargo audit twice, once on main HEAD, 
 of both invocations is the same, the test passes (with us being alerted to this situtation via a special pipeline that
 does not block PRs). If not, it fails, preventing PRs from introducing new vulnerable dependencies.
 """
-import contextlib
-import os
 import statistics
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -31,10 +29,15 @@ from typing import Callable, List, Optional, TypeVar
 import scipy
 
 from framework import utils
+from framework.defs import FC_WORKSPACE_DIR
+from framework.properties import global_props
+from framework.utils import CommandReturn
+from framework.with_filelock import with_filelock
+from host_tools.cargo_build import DEFAULT_TARGET_DIR
 
 # Locally, this will always compare against main, even if we try to merge into, say, a feature branch.
 # We might want to do a more sophisticated way to determine a "parent" branch here.
-DEFAULT_A_REVISION = os.environ.get("BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main")
+DEFAULT_A_REVISION = global_props.buildkite_revision_a or "main"
 
 
 T = TypeVar("T")
@@ -79,28 +82,97 @@ def git_ab_test(
              (alternatively, your comparator can perform any required assertions and not return anything).
     """
 
-    # We can't just checkout random branches in the current working directory. Locally, this might not work because of
-    # uncommitted changes. In the CI this will not work because multiple tests will run in parallel, and thus switching
-    # branches will cause random failures in other tests.
-    with temporary_checkout(a_revision) as a_tmp:
-        result_a = test_runner(a_tmp, True)
+    with TemporaryDirectory() as tmp_dir:
+        dir_a = git_clone(Path(tmp_dir) / a_revision, a_revision)
+        result_a = test_runner(dir_a, True)
 
         if b_revision:
-            with temporary_checkout(b_revision) as b_tmp:
-                result_b = test_runner(b_tmp, False)
-                # Have to call comparator here to make sure both temporary directories exist (as the comparator
-                # might rely on some files that were created during test running, see the benchmark test)
-                comparison = comparator(result_a, result_b)
+            dir_b = git_clone(Path(tmp_dir) / b_revision, b_revision)
         else:
             # By default, pytest execution happens inside the `tests` subdirectory. Pass the repository root, as
             # documented.
-            result_b = test_runner(Path.cwd().parent, False)
-            comparison = comparator(result_a, result_b)
+            dir_b = Path.cwd().parent
+        result_b = test_runner(dir_b, False)
 
+        comparison = comparator(result_a, result_b)
         return result_a, result_b, comparison
 
 
-def check_regression(a_samples: List[float], b_samples: List[float]):
+DEFAULT_A_DIRECTORY = FC_WORKSPACE_DIR / "build" / "main"
+DEFAULT_B_DIRECTORY = FC_WORKSPACE_DIR / "build" / "cargo_target" / DEFAULT_TARGET_DIR
+
+
+def binary_ab_test(
+    test_runner: Callable[[Path, bool], T],
+    comparator: Callable[[T, T], U] = default_comparator,
+    *,
+    a_directory: Path = DEFAULT_A_DIRECTORY,
+    b_directory: Path = DEFAULT_B_DIRECTORY,
+):
+    """
+    Similar to `git_ab_test`, but instead of locally checking out different revisions, it operates on
+    directories containing firecracker/jailer binaries
+    """
+    result_a = test_runner(a_directory, True)
+    result_b = test_runner(b_directory, False)
+
+    return result_a, result_b, comparator(result_a, result_b)
+
+
+def git_ab_test_host_command_if_pr(
+    command: str,
+    *,
+    comparator: Callable[[CommandReturn, CommandReturn], bool] = default_comparator,
+    check_in_nonpr=True,
+):
+    """Runs the given bash command as an A/B-Test if we're in a pull request context (asserting that its stdout and
+    stderr did not change across the PR). Otherwise runs the command, asserting it returns a zero exit code
+    """
+    if global_props.buildkite_pr:
+        git_ab_test_host_command(command, comparator=comparator)
+        return None
+
+    return utils.run_cmd(
+        command,
+        check=check_in_nonpr,
+        cwd=Path.cwd().parent,
+    )
+
+
+def git_ab_test_host_command(
+    command: str,
+    *,
+    comparator: Callable[[CommandReturn, CommandReturn], bool] = default_comparator,
+    a_revision: str = DEFAULT_A_REVISION,
+    b_revision: Optional[str] = None,
+):
+    """Performs an A/B-Test of the specified command, asserting that both the A and B invokations return the same stdout/stderr"""
+    (_, old_out, old_err), (_, new_out, new_err), the_same = git_ab_test(
+        lambda path, _is_a: utils.run_cmd(command, cwd=path),
+        comparator,
+        a_revision=a_revision,
+        b_revision=b_revision,
+    )
+
+    assert (
+        the_same
+    ), f"The output of running command `{command}` changed:\nOld:\nstdout:\n{old_out}\nstderr:\n{old_err}\n\nNew:\nstdout:\n{new_out}\nstderr:\n{new_err}"
+
+
+def set_did_not_grow_comparator(
+    set_generator: Callable[[CommandReturn], set]
+) -> Callable[[CommandReturn, CommandReturn], bool]:
+    """Factory function for comparators to use with git_ab_test_command that converts the command output to sets
+    (using the given callable) and then checks that the "B" set is a subset of the "A" set
+    """
+    return lambda output_a, output_b: set_generator(output_b).issubset(
+        set_generator(output_a)
+    )
+
+
+def check_regression(
+    a_samples: List[float], b_samples: List[float], *, n_resamples: int = 9999
+):
     """Checks for a regression by performing a permutation test. A permutation test is a non-parametric test that takes
     three parameters: Two populations (sets of samples) and a function computing a "statistic" based on two populations.
     First, the test computes the statistic for the initial populations. It then randomly
@@ -120,40 +192,28 @@ def check_regression(a_samples: List[float], b_samples: List[float]):
         # Compute the difference of means, such that a positive different indicates potential for regression.
         lambda x, y: statistics.mean(y) - statistics.mean(x),
         vectorized=False,
+        n_resamples=n_resamples,
     )
 
 
-@contextlib.contextmanager
-def temporary_checkout(revision: str):
-    """
-    Context manager that checks out firecracker in a temporary directory and `chdir`s into it
+@with_filelock
+def git_clone(clone_path, commitish):
+    """Clone the repository at `commit`.
 
-    Will change back to whatever was the current directory when the context manager was entered, even if exceptions
-    happen along the way.
+    :return: the working copy directory.
     """
-    with TemporaryDirectory() as tmp_dir:
-        # `git clone` can take a path instead of an URL, which causes it to create a copy of the
-        # repository at the given path. However, that path needs to point to the root of a repository,
-        # it cannot be some arbitrary subdirectory. Therefore:
+    if not clone_path.exists():
+        ret, _, _ = utils.run_cmd(f"git cat-file -t {commitish}")
+        if ret != 0:
+            # git didn't recognize this object; qualify it if it is a branch
+            commitish = f"origin/{commitish}"
+        # make a temp branch for that commit so we can directly check it out
+        branch_name = f"tmp-{commitish}"
+        utils.check_output(f"git branch {branch_name} {commitish}")
         _, git_root, _ = utils.run_cmd("git rev-parse --show-toplevel")
         # split off the '\n' at the end of the stdout
-        utils.run_cmd(f"git clone {git_root.strip()} {tmp_dir}")
-
-        with chdir(tmp_dir):
-            utils.run_cmd(f"git checkout {revision}")
-
-        yield Path(tmp_dir)
-
-
-# Once we upgrade to python 3.11, this will be in contextlib:
-# https://docs.python.org/3/library/contextlib.html#contextlib.chdir
-@contextlib.contextmanager
-def chdir(to):
-    """Context manager that temporarily `chdir`s to the specified path"""
-    cur = os.getcwd()
-
-    try:
-        os.chdir(to)
-        yield
-    finally:
-        os.chdir(cur)
+        utils.check_output(
+            f"git clone -b {branch_name} {git_root.strip()} {clone_path}"
+        )
+        utils.check_output(f"git branch -D {branch_name}")
+    return clone_path

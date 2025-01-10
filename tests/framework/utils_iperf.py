@@ -7,22 +7,7 @@ import json
 import time
 
 from framework import utils
-from framework.utils import CmdBuilder, CpuMap, get_cpu_percent, summarize_cpu_percent
-
-DURATION = "duration"
-IPERF3_END_RESULTS_TAG = "end"
-THROUGHPUT = "throughput"
-CPU_UTILIZATION_VMM = "cpu_utilization_vmm"
-CPU_UTILIZATION_VCPUS_TOTAL = "cpu_utilization_vcpus_total"
-
-# Dictionary mapping modes (guest-to-host, host-to-guest, bidirectional) to arguments passed to the iperf3 clients spawned
-MODE_MAP = {"g2h": [""], "h2g": ["-R"], "bd": ["", "-R"]}
-
-# Dictionary doing the reserve of the above, for pretty-printing
-REV_MODE_MAP = {"": "g2h", "-R": "h2g"}
-
-# Number of seconds to wait for the iperf3 server to start
-SERVER_STARTUP_TIME_SEC = 2
+from framework.utils import CmdBuilder, CpuMap, track_cpu_utilization
 
 
 class IPerf3Test:
@@ -57,35 +42,84 @@ class IPerf3Test:
         assert self._num_clients < CpuMap.len() - self._microvm.vcpus_count - 2
 
         for server_idx in range(self._num_clients):
-            cmd = self.host_command(server_idx).build()
             assigned_cpu = CpuMap(first_free_cpu)
-            utils.run_cmd(
-                f"taskset --cpu-list {assigned_cpu} {self._microvm.jailer.netns_cmd_prefix()} {cmd}"
+            cmd = (
+                self.host_command(server_idx)
+                .with_arg("--affinity", assigned_cpu)
+                .build()
             )
+            utils.check_output(f"{self._microvm.netns.cmd_prefix()} {cmd}")
             first_free_cpu += 1
 
-        time.sleep(SERVER_STARTUP_TIME_SEC)
+        # Wait for the iperf3 server to start
+        time.sleep(2)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
             cpu_load_future = executor.submit(
-                get_cpu_percent,
-                self._microvm.jailer_clone_pid,
+                track_cpu_utilization,
+                self._microvm.firecracker_pid,
                 # Ignore the final two data points as they are impacted by test teardown
                 self._runtime - 2,
                 self._omit,
             )
 
+            clients = []
             for client_idx in range(self._num_clients):
-                futures.append(executor.submit(self.spawn_iperf3_client, client_idx))
+                client_mode = self.client_mode(client_idx)
+                client_mode_flag = self.client_mode_to_iperf3_flag(client_mode)
+                client_future = executor.submit(
+                    self.spawn_iperf3_client, client_idx, client_mode_flag
+                )
+                clients.append((client_mode, client_future))
 
             data = {"cpu_load_raw": cpu_load_future.result(), "g2h": [], "h2g": []}
 
-            for i, future in enumerate(futures):
-                key = REV_MODE_MAP[MODE_MAP[self._mode][i % len(MODE_MAP[self._mode])]]
-                data[key].append(json.loads(future.result()))
+            for mode, future in clients:
+                data[mode].append(json.loads(future.result()))
 
             return data
+
+    def client_mode(self, client_idx):
+        """Converts client index into client mode"""
+        match self._mode:
+            case "g2h":
+                client_mode = "g2h"
+            case "h2g":
+                client_mode = "h2g"
+            case "bd":
+                # in bidirectional mode we alternate
+                # modes
+                if client_idx % 2 == 0:
+                    client_mode = "g2h"
+                else:
+                    client_mode = "h2g"
+        return client_mode
+
+    @staticmethod
+    def client_mode_to_iperf3_flag(client_mode):
+        """Converts client mode into iperf3 mode flag"""
+        match client_mode:
+            case "g2h":
+                client_mode_flag = ""
+            case "h2g":
+                client_mode_flag = "-R"
+        return client_mode_flag
+
+    def spawn_iperf3_client(self, client_idx, client_mode_flag):
+        """
+        Spawns an iperf3 client within the guest. The `client_idx` determines what direction data should flow
+        for this particular client (e.g. client-to-server or server-to-client)
+        """
+
+        # Add the port where the iperf3 client is going to send/receive.
+        cmd = (
+            self.guest_command(client_idx)
+            .with_arg(client_mode_flag)
+            .with_arg("--affinity", client_idx % self._microvm.vcpus_count)
+            .build()
+        )
+
+        return self._microvm.ssh.check_output(cmd).stdout
 
     def host_command(self, port_offset):
         """Builds the command used for spawning an iperf3 server on the host"""
@@ -95,26 +129,6 @@ class IPerf3Test:
             .with_arg("-p", self._base_port + port_offset)
             .with_arg("-1")
         )
-
-    def spawn_iperf3_client(self, client_idx):
-        """
-        Spawns an iperf3 client within the guest. The `client_idx` determines what direction data should flow
-        for this particular client (e.g. client-to-server or server-to-client)
-        """
-        # Distribute modes evenly
-        mode = MODE_MAP[self._mode][client_idx % len(MODE_MAP[self._mode])]
-
-        # Add the port where the iperf3 client is going to send/receive.
-        cmd = self.guest_command(client_idx).with_arg(mode).build()
-
-        pinned_cmd = (
-            f"taskset --cpu-list {client_idx % self._microvm.vcpus_count} {cmd}"
-        )
-        rc, stdout, stderr = self._microvm.ssh.run(pinned_cmd)
-
-        assert rc == 0, stderr
-
-        return stdout
 
     def guest_command(self, port_offset):
         """Builds the command used for spawning an iperf3 client in the guest"""
@@ -132,38 +146,31 @@ class IPerf3Test:
         return cmd
 
 
-def consume_iperf3_output(stats_consumer, iperf_result):
+def emit_iperf3_metrics(metrics, iperf_result, omit):
     """Consume the iperf3 data produced by the tcp/vsock throughput performance tests"""
+    cpu_util = iperf_result["cpu_load_raw"]
+    for thread_name, values in cpu_util.items():
+        for value in values:
+            metrics.put_metric(f"cpu_utilization_{thread_name}", value, "Percent")
 
-    for iperf3_raw in iperf_result["g2h"] + iperf_result["h2g"]:
-        total_received = iperf3_raw[IPERF3_END_RESULTS_TAG]["sum_received"]
-        duration = float(total_received["seconds"])
-        stats_consumer.consume_data(DURATION, duration)
+    data_points = zip(
+        *[time_series["intervals"][omit:] for time_series in iperf_result["g2h"]]
+    )
 
-        # Computed at the receiving end.
-        total_recv_bytes = int(total_received["bytes"])
-        tput = round((total_recv_bytes * 8) / (1024 * 1024 * duration), 2)
-        stats_consumer.consume_data(THROUGHPUT, tput)
+    for point_in_time in data_points:
+        metrics.put_metric(
+            "throughput_guest_to_host",
+            sum(interval["sum"]["bits_per_second"] for interval in point_in_time),
+            "Bits/Second",
+        )
 
-    vmm_util, vcpu_util = summarize_cpu_percent(iperf_result["cpu_load_raw"])
+    data_points = zip(
+        *[time_series["intervals"][omit:] for time_series in iperf_result["h2g"]]
+    )
 
-    stats_consumer.consume_stat("Avg", CPU_UTILIZATION_VMM, vmm_util)
-    stats_consumer.consume_stat("Avg", CPU_UTILIZATION_VCPUS_TOTAL, vcpu_util)
-
-    for idx, time_series in enumerate(iperf_result["g2h"]):
-        yield from [
-            (f"{THROUGHPUT}_g2h_{idx}", x["sum"]["bits_per_second"], "Megabits/Second")
-            for x in time_series["intervals"]
-        ]
-
-    for idx, time_series in enumerate(iperf_result["h2g"]):
-        yield from [
-            (f"{THROUGHPUT}_h2g_{idx}", x["sum"]["bits_per_second"], "Megabits/Second")
-            for x in time_series["intervals"]
-        ]
-
-    for thread_name, data in iperf_result["cpu_load_raw"].items():
-        yield from [
-            (f"cpu_utilization_{thread_name}", x, "Percent")
-            for x in list(data.values())[0]
-        ]
+    for point_in_time in data_points:
+        metrics.put_metric(
+            "throughput_host_to_guest",
+            sum(interval["sum"]["bits_per_second"] for interval in point_in_time),
+            "Bits/Second",
+        )

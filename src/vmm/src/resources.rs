@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
-use utils::net::ipv4addr::is_link_local_valid;
 
 use crate::cpu_config::templates::CustomCpuTemplate;
 use crate::device_manager::persist::SharedDeviceType;
+use crate::logger::{info, log_dev_preview_warning};
 use crate::mmds;
 use crate::mmds::data_store::{Mmds, MmdsVersion};
 use crate::mmds::ns::MmdsNetworkStack;
+use crate::utils::net::ipv4addr::is_link_local_valid;
 use crate::vmm_config::balloon::*;
 use crate::vmm_config::boot_source::{
     BootConfig, BootSource, BootSourceConfig, BootSourceConfigError,
@@ -20,44 +21,44 @@ use crate::vmm_config::boot_source::{
 use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
 use crate::vmm_config::instance_info::InstanceInfo;
-use crate::vmm_config::logger_config::{init_logger, LoggerConfig, LoggerConfigError};
 use crate::vmm_config::machine_config::{
-    MachineConfig, MachineConfigUpdate, VmConfig, VmConfigError,
+    HugePageConfig, MachineConfig, MachineConfigUpdate, VmConfig, VmConfigError,
 };
 use crate::vmm_config::metrics::{init_metrics, MetricsConfig, MetricsConfigError};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
 use crate::vmm_config::vsock::*;
+use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryMmap, MemoryError};
 
 /// Errors encountered when configuring microVM resources.
-#[derive(Debug, thiserror::Error, displaydoc::Display, derive_more::From)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResourcesError {
     /// Balloon device error: {0}
-    BalloonDevice(BalloonConfigError),
+    BalloonDevice(#[from] BalloonConfigError),
     /// Block device error: {0}
-    BlockDevice(DriveError),
+    BlockDevice(#[from] DriveError),
     /// Boot source error: {0}
-    BootSource(BootSourceConfigError),
+    BootSource(#[from] BootSourceConfigError),
     /// File operation error: {0}
-    File(std::io::Error),
+    File(#[from] std::io::Error),
     /// Invalid JSON: {0}
-    InvalidJson(serde_json::Error),
+    InvalidJson(#[from] serde_json::Error),
     /// Logger error: {0}
-    Logger(LoggerConfigError),
+    Logger(#[from] crate::logger::LoggerUpdateError),
     /// Metrics error: {0}
-    Metrics(MetricsConfigError),
+    Metrics(#[from] MetricsConfigError),
     /// MMDS error: {0}
-    Mmds(mmds::data_store::Error),
+    Mmds(#[from] mmds::data_store::MmdsDatastoreError),
     /// MMDS config error: {0}
-    MmdsConfig(MmdsConfigError),
+    MmdsConfig(#[from] MmdsConfigError),
     /// Network device error: {0}
-    NetDevice(NetworkInterfaceError),
+    NetDevice(#[from] NetworkInterfaceError),
     /// VM config error: {0}
-    VmConfig(VmConfigError),
+    VmConfig(#[from] VmConfigError),
     /// Vsock device error: {0}
-    VsockDevice(VsockConfigError),
+    VsockDevice(#[from] VsockConfigError),
     /// Entropy device error: {0}
-    EntropyDevice(EntropyDeviceError),
+    EntropyDevice(#[from] EntropyDeviceError),
 }
 
 /// Used for configuring a vmm from one single json passed to the Firecracker process.
@@ -72,7 +73,7 @@ pub struct VmmConfig {
     #[serde(rename = "cpu-config")]
     cpu_config: Option<PathBuf>,
     #[serde(rename = "logger")]
-    logger: Option<LoggerConfig>,
+    logger: Option<crate::logger::LoggerConfig>,
     #[serde(rename = "machine-config")]
     machine_config: Option<MachineConfig>,
     #[serde(rename = "metrics")]
@@ -94,7 +95,7 @@ pub struct VmResources {
     /// The vCpu and memory configuration for this microVM.
     pub vm_config: VmConfig,
     /// The boot source spec (contains both config and builder) for this microVM.
-    boot_source: BootSource,
+    pub boot_source: BootSource,
     /// The block devices.
     pub block: BlockBuilder,
     /// The vsock device.
@@ -125,8 +126,8 @@ impl VmResources {
     ) -> Result<Self, ResourcesError> {
         let vmm_config = serde_json::from_str::<VmmConfig>(config_json)?;
 
-        if let Some(logger) = vmm_config.logger {
-            init_logger(logger, instance_info)?;
+        if let Some(logger_config) = vmm_config.logger {
+            crate::logger::LOGGER.update(logger_config)?;
         }
 
         if let Some(metrics) = vmm_config.metrics {
@@ -172,7 +173,7 @@ impl VmResources {
             resources.locked_mmds_or_default().put_data(
                 serde_json::from_str(data).expect("MMDS error: metadata provided not valid json"),
             )?;
-            log::info!("Successfully added metadata to mmds from file");
+            info!("Successfully added metadata to mmds from file");
         }
 
         if let Some(mmds_config) = vmm_config.mmds_config {
@@ -202,10 +203,13 @@ impl VmResources {
 
     /// Updates the resources from a restored device (used for configuring resources when
     /// restoring from a snapshot).
-    pub fn update_from_restored_device(&mut self, device: SharedDeviceType) {
+    pub fn update_from_restored_device(
+        &mut self,
+        device: SharedDeviceType,
+    ) -> Result<(), ResourcesError> {
         match device {
-            SharedDeviceType::Block(block) => {
-                self.block.add_device(block);
+            SharedDeviceType::VirtioBlock(block) => {
+                self.block.add_virtio_device(block);
             }
 
             SharedDeviceType::Network(network) => {
@@ -214,6 +218,10 @@ impl VmResources {
 
             SharedDeviceType::Balloon(balloon) => {
                 self.balloon.set_device(balloon);
+
+                if self.vm_config.huge_pages != HugePageConfig::None {
+                    return Err(ResourcesError::BalloonDevice(BalloonConfigError::HugePages));
+                }
             }
 
             SharedDeviceType::Vsock(vsock) => {
@@ -223,16 +231,8 @@ impl VmResources {
                 self.entropy.set_device(entropy);
             }
         }
-    }
 
-    /// Returns whether dirty page tracking is enabled or not.
-    pub fn track_dirty_pages(&self) -> bool {
-        self.vm_config.track_dirty_pages
-    }
-
-    /// Configures the dirty page tracking functionality of the microVM.
-    pub fn set_track_dirty_pages(&mut self, dirty_page_tracking: bool) {
-        self.vm_config.track_dirty_pages = dirty_page_tracking;
+        Ok(())
     }
 
     /// Add a custom CPU template to the VM resources
@@ -243,12 +243,16 @@ impl VmResources {
 
     /// Updates the configuration of the microVM.
     pub fn update_vm_config(&mut self, update: &MachineConfigUpdate) -> Result<(), VmConfigError> {
-        self.vm_config.update(update)?;
+        if update.huge_pages.is_some() && update.huge_pages != Some(HugePageConfig::None) {
+            log_dev_preview_warning("Huge pages support", None);
+        }
+
+        let updated = self.vm_config.update(update)?;
 
         // The VM cannot have a memory size smaller than the target size
         // of the balloon device, if present.
         if self.balloon.get().is_some()
-            && self.vm_config.mem_size_mib
+            && updated.mem_size_mib
                 < self
                     .balloon
                     .get_config()
@@ -257,6 +261,18 @@ impl VmResources {
         {
             return Err(VmConfigError::IncompatibleBalloonSize);
         }
+
+        if self.balloon.get().is_some() && updated.huge_pages != HugePageConfig::None {
+            return Err(VmConfigError::BalloonAndHugePages);
+        }
+
+        if self.boot_source.config.initrd_path.is_some()
+            && updated.huge_pages != HugePageConfig::None
+        {
+            return Err(VmConfigError::InitrdAndHugePages);
+        }
+
+        self.vm_config = updated;
 
         Ok(())
     }
@@ -299,16 +315,6 @@ impl VmResources {
         mmds_config
     }
 
-    /// Gets a reference to the boot source configuration.
-    pub fn boot_source_config(&self) -> &BootSourceConfig {
-        &self.boot_source.config
-    }
-
-    /// Gets a reference to the boot source builder.
-    pub fn boot_source_builder(&self) -> Option<&BootConfig> {
-        self.boot_source.builder.as_ref()
-    }
-
     /// Sets a balloon device to be attached when the VM starts.
     pub fn set_balloon_device(
         &mut self,
@@ -320,6 +326,10 @@ impl VmResources {
             return Err(BalloonConfigError::TooManyPagesRequested);
         }
 
+        if self.vm_config.huge_pages != HugePageConfig::None {
+            return Err(BalloonConfigError::HugePages);
+        }
+
         self.balloon.set(config)
     }
 
@@ -328,14 +338,18 @@ impl VmResources {
         &mut self,
         boot_source_cfg: BootSourceConfig,
     ) -> Result<(), BootSourceConfigError> {
-        self.set_boot_source_config(boot_source_cfg);
-        self.boot_source.builder = Some(BootConfig::new(self.boot_source_config())?);
-        Ok(())
-    }
+        if boot_source_cfg.initrd_path.is_some()
+            && self.vm_config.huge_pages != HugePageConfig::None
+        {
+            return Err(BootSourceConfigError::HugePagesAndInitRd);
+        }
 
-    /// Set the boot source configuration (contains raw kernel config details).
-    pub fn set_boot_source_config(&mut self, boot_source_cfg: BootSourceConfig) {
-        self.boot_source.config = boot_source_cfg;
+        self.boot_source = BootSource {
+            builder: Some(BootConfig::new(&boot_source_cfg)?),
+            config: boot_source_cfg,
+        };
+
+        Ok(())
     }
 
     /// Inserts a block to be attached when the VM starts.
@@ -443,6 +457,42 @@ impl VmResources {
 
         Ok(())
     }
+
+    /// Allocates guest memory in a configuration most appropriate for these [`VmResources`].
+    ///
+    /// If vhost-user-blk devices are in use, allocates memfd-backed shared memory, otherwise
+    /// prefers anonymous memory for performance reasons.
+    pub fn allocate_guest_memory(&self) -> Result<GuestMemoryMmap, MemoryError> {
+        let vhost_user_device_used = self
+            .block
+            .devices
+            .iter()
+            .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
+
+        // Page faults are more expensive for shared memory mapping, including  memfd.
+        // For this reason, we only back guest memory with a memfd
+        // if a vhost-user-blk device is configured in the VM, otherwise we fall back to
+        // an anonymous private memory.
+        //
+        // The vhost-user-blk branch is not currently covered by integration tests in Rust,
+        // because that would require running a backend process. If in the future we converge to
+        // a single way of backing guest memory for vhost-user and non-vhost-user cases,
+        // that would not be worth the effort.
+        if vhost_user_device_used {
+            GuestMemoryMmap::memfd_backed(
+                self.vm_config.mem_size_mib,
+                self.vm_config.track_dirty_pages,
+                self.vm_config.huge_pages,
+            )
+        } else {
+            let regions = crate::arch::arch_memory_regions(self.vm_config.mem_size_mib << 20);
+            GuestMemoryMmap::from_raw_regions(
+                &regions,
+                self.vm_config.track_dirty_pages,
+                self.vm_config.huge_pages,
+            )
+        }
+    }
 }
 
 impl From<&VmResources> for VmmConfig {
@@ -450,7 +500,7 @@ impl From<&VmResources> for VmmConfig {
         VmmConfig {
             balloon_device: resources.balloon.get_config().ok(),
             block_devices: resources.block.configs(),
-            boot_source: resources.boot_source_config().clone(),
+            boot_source: resources.boot_source.config.clone(),
             cpu_config: None,
             logger: None,
             machine_config: Some(MachineConfig::from(&resources.vm_config)),
@@ -471,19 +521,21 @@ mod tests {
     use std::str::FromStr;
 
     use serde_json::{Map, Value};
-    use utils::net::mac::MacAddr;
-    use utils::tempfile::TempFile;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::cpu_config::templates::{CpuTemplateType, StaticCpuTemplate};
+    use crate::devices::virtio::balloon::Balloon;
+    use crate::devices::virtio::block::virtio::VirtioBlockError;
+    use crate::devices::virtio::block::{BlockError, CacheType};
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
-    use crate::logger::{LevelFilter, LOGGER};
     use crate::resources::VmResources;
+    use crate::utils::net::mac::MacAddr;
     use crate::vmm_config::boot_source::{
         BootConfig, BootSource, BootSourceConfig, DEFAULT_KERNEL_CMDLINE,
     };
-    use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig, FileEngineType};
-    use crate::vmm_config::machine_config::{MachineConfig, VmConfigError};
+    use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig};
+    use crate::vmm_config::machine_config::{HugePageConfig, MachineConfig, VmConfigError};
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vmm_config::RateLimiterConfig;
@@ -518,13 +570,16 @@ mod tests {
         (
             BlockDeviceConfig {
                 drive_id: "block1".to_string(),
-                path_on_host: tmp_file.as_path().to_str().unwrap().to_string(),
-                is_root_device: false,
                 partuuid: Some("0eaa91a0-01".to_string()),
+                is_root_device: false,
                 cache_type: CacheType::Unsafe,
-                is_read_only: false,
+
+                is_read_only: Some(false),
+                path_on_host: Some(tmp_file.as_path().to_str().unwrap().to_string()),
                 rate_limiter: Some(RateLimiterConfig::default()),
-                file_engine_type: FileEngineType::default(),
+                file_engine_type: None,
+
+                socket: None,
             },
             tmp_file,
         )
@@ -600,17 +655,25 @@ mod tests {
         // these resources, it is considered an invalid json and the test will crash.
 
         // Invalid JSON string must yield a `serde_json` error.
-        match VmResources::from_json(r#"}"#, &default_instance_info, HTTP_MAX_PAYLOAD_SIZE, None) {
-            Err(ResourcesError::InvalidJson(_)) => (),
-            _ => unreachable!(),
-        }
+        let error =
+            VmResources::from_json(r#"}"#, &default_instance_info, HTTP_MAX_PAYLOAD_SIZE, None)
+                .unwrap_err();
+        assert!(
+            matches!(error, ResourcesError::InvalidJson(_)),
+            "{:?}",
+            error
+        );
 
         // Valid JSON string without the configuration for kernel or rootfs
         // result in an invalid JSON error.
-        match VmResources::from_json(r#"{}"#, &default_instance_info, HTTP_MAX_PAYLOAD_SIZE, None) {
-            Err(ResourcesError::InvalidJson(_)) => (),
-            _ => unreachable!(),
-        }
+        let error =
+            VmResources::from_json(r#"{}"#, &default_instance_info, HTTP_MAX_PAYLOAD_SIZE, None)
+                .unwrap_err();
+        assert!(
+            matches!(error, ResourcesError::InvalidJson(_)),
+            "{:?}",
+            error
+        );
 
         // Invalid kernel path.
         let mut json = format!(
@@ -631,15 +694,21 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        match VmResources::from_json(
+        let error = VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
             None,
-        ) {
-            Err(ResourcesError::BootSource(BootSourceConfigError::InvalidKernelPath(_))) => (),
-            _ => unreachable!(),
-        }
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ResourcesError::BootSource(BootSourceConfigError::InvalidKernelPath(_))
+            ),
+            "{:?}",
+            error
+        );
 
         // Invalid rootfs path.
         json = format!(
@@ -660,92 +729,23 @@ mod tests {
             kernel_file.as_path().to_str().unwrap()
         );
 
-        match VmResources::from_json(
+        let error = VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
             None,
-        ) {
-            Err(ResourcesError::BlockDevice(DriveError::InvalidBlockDevicePath(_))) => (),
-            _ => unreachable!(),
-        }
-
-        // Invalid vCPU number.
-        json = format!(
-            r#"{{
-                    "boot-source": {{
-                        "kernel_image_path": "{}",
-                        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
-                    }},
-                    "drives": [
-                        {{
-                            "drive_id": "rootfs",
-                            "path_on_host": "{}",
-                            "is_root_device": true,
-                            "is_read_only": false
-                        }}
-                    ],
-                    "machine-config": {{
-                        "vcpu_count": 0,
-                        "mem_size_mib": 1024
-                    }}
-            }}"#,
-            kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap()
-        );
-
-        match VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None,
-        ) {
-            Err(ResourcesError::InvalidJson(_)) => (),
-            _ => unreachable!(),
-        }
-
-        // Valid config for x86 but invalid on aarch64 because smt is not available.
-        json = format!(
-            r#"{{
-                    "boot-source": {{
-                        "kernel_image_path": "{}",
-                        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
-                    }},
-                    "drives": [
-                        {{
-                            "drive_id": "rootfs",
-                            "path_on_host": "{}",
-                            "is_root_device": true,
-                            "is_read_only": false
-                        }}
-                    ],
-                    "machine-config": {{
-                        "vcpu_count": 2,
-                        "mem_size_mib": 1024,
-                        "smt": true
-                    }}
-            }}"#,
-            kernel_file.as_path().to_str().unwrap(),
-            rootfs_file.as_path().to_str().unwrap()
-        );
-
-        #[cfg(target_arch = "x86_64")]
-        assert!(VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None
         )
-        .is_ok());
-        #[cfg(target_arch = "aarch64")]
-        assert!(VmResources::from_json(
-            json.as_str(),
-            &default_instance_info,
-            HTTP_MAX_PAYLOAD_SIZE,
-            None
-        )
-        .is_err());
-
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ResourcesError::BlockDevice(DriveError::CreateBlockDevice(
+                    BlockError::VirtioBackend(VirtioBlockError::BackingFile(_, _)),
+                ))
+            ),
+            "{:?}",
+            error
+        );
         // Valid config for x86 but invalid on aarch64 since it uses cpu_template.
         json = format!(
             r#"{{
@@ -771,21 +771,21 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
         #[cfg(target_arch = "x86_64")]
-        assert!(VmResources::from_json(
+        VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
-            None
+            None,
         )
-        .is_ok());
+        .unwrap();
         #[cfg(target_arch = "aarch64")]
-        assert!(VmResources::from_json(
+        VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
-            None
+            None,
         )
-        .is_err());
+        .unwrap_err();
 
         // Invalid memory size.
         json = format!(
@@ -811,15 +811,21 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        match VmResources::from_json(
+        let error = VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
             None,
-        ) {
-            Err(ResourcesError::VmConfig(VmConfigError::InvalidMemorySize)) => (),
-            _ => unreachable!(),
-        }
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ResourcesError::VmConfig(VmConfigError::InvalidMemorySize)
+            ),
+            "{:?}",
+            error
+        );
 
         // Invalid path for logger pipe.
         json = format!(
@@ -844,18 +850,21 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        match VmResources::from_json(
+        let error = VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
             None,
-        ) {
-            Err(ResourcesError::Logger(LoggerConfigError::InitializationFailure { .. })) => (),
-            _ => unreachable!(),
-        }
-
-        // The previous call enables the logger. We need to disable it.
-        LOGGER.set_max_level(LevelFilter::Off);
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ResourcesError::Logger(crate::logger::LoggerUpdateError(_))
+            ),
+            "{:?}",
+            error
+        );
 
         // Invalid path for metrics pipe.
         json = format!(
@@ -880,15 +889,21 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        match VmResources::from_json(
+        let error = VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
             None,
-        ) {
-            Err(ResourcesError::Metrics(MetricsConfigError::InitializationFailure { .. })) => (),
-            _ => unreachable!(),
-        }
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ResourcesError::Metrics(MetricsConfigError::InitializationFailure { .. })
+            ),
+            "{:?}",
+            error
+        );
 
         // Reuse of a host name.
         json = format!(
@@ -920,17 +935,24 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap()
         );
 
-        match VmResources::from_json(
+        let error = VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
             None,
-        ) {
-            Err(ResourcesError::NetDevice(NetworkInterfaceError::CreateNetworkDevice(
-                crate::devices::virtio::net::NetError::TapOpen { .. },
-            ))) => (),
-            _ => unreachable!(),
-        }
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ResourcesError::NetDevice(NetworkInterfaceError::CreateNetworkDevice(
+                    crate::devices::virtio::net::NetError::TapOpen { .. },
+                ))
+            ),
+            "{:?}",
+            error
+        );
 
         // Let's try now passing a valid configuration. We won't include any logger
         // or metrics configuration because these were already initialized in other
@@ -969,13 +991,13 @@ mod tests {
             kernel_file.as_path().to_str().unwrap(),
             rootfs_file.as_path().to_str().unwrap(),
         );
-        assert!(VmResources::from_json(
+        VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
-            None
+            None,
         )
-        .is_ok());
+        .unwrap();
 
         // Test all configuration, this time trying to set default configuration
         // for version and IPv4 address.
@@ -1061,15 +1083,14 @@ mod tests {
             rootfs_file.as_path().to_str().unwrap(),
         );
 
-        match VmResources::from_json(
+        let error = VmResources::from_json(
             json.as_str(),
             &default_instance_info,
             HTTP_MAX_PAYLOAD_SIZE,
             None,
-        ) {
-            Err(ResourcesError::File(_)) => (),
-            _ => unreachable!(),
-        }
+        )
+        .unwrap_err();
+        assert!(matches!(error, ResourcesError::File(_)), "{:?}", error);
     }
 
     #[test]
@@ -1141,7 +1162,8 @@ mod tests {
                             "drive_id": "rootfs",
                             "path_on_host": "{}",
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": false,
+                            "io_engine": "Sync"
                         }}
                     ],
                     "network-interfaces": [
@@ -1215,7 +1237,8 @@ mod tests {
                             "drive_id": "rootfs",
                             "path_on_host": "{}",
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": false,
+                            "io_engine": "Sync"
                         }}
                     ],
                     "network-interfaces": [
@@ -1274,7 +1297,8 @@ mod tests {
                             "drive_id": "rootfs",
                             "path_on_host": "{}",
                             "is_root_device": true,
-                            "is_read_only": false
+                            "is_read_only": false,
+                            "io_engine": "Sync"
                         }}
                     ],
                     "network-interfaces": [
@@ -1320,12 +1344,13 @@ mod tests {
         let mut aux_vm_config = MachineConfigUpdate {
             vcpu_count: Some(32),
             mem_size_mib: Some(512),
-            smt: Some(true),
+            smt: Some(false),
             #[cfg(target_arch = "x86_64")]
             cpu_template: Some(StaticCpuTemplate::T2),
             #[cfg(target_arch = "aarch64")]
             cpu_template: Some(StaticCpuTemplate::V1N1),
             track_dirty_pages: Some(false),
+            huge_pages: Some(HugePageConfig::None),
         };
 
         assert_ne!(
@@ -1349,7 +1374,25 @@ mod tests {
             vm_resources.update_vm_config(&aux_vm_config),
             Err(VmConfigError::InvalidVcpuCount)
         );
+
+        // Check that SMT is not supported on aarch64, and that on x86_64 enabling it requires vcpu
+        // count to be even.
+        aux_vm_config.smt = Some(true);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            vm_resources.update_vm_config(&aux_vm_config),
+            Err(VmConfigError::SmtNotSupported)
+        );
+        aux_vm_config.vcpu_count = Some(3);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            vm_resources.update_vm_config(&aux_vm_config),
+            Err(VmConfigError::InvalidVcpuCount)
+        );
         aux_vm_config.vcpu_count = Some(32);
+        #[cfg(target_arch = "x86_64")]
+        vm_resources.update_vm_config(&aux_vm_config).unwrap();
+        aux_vm_config.smt = Some(false);
 
         // Invalid mem_size_mib.
         aux_vm_config.mem_size_mib = Some(0);
@@ -1375,7 +1418,22 @@ mod tests {
 
         // mem_size_mib compatible with balloon size.
         aux_vm_config.mem_size_mib = Some(256);
-        assert!(vm_resources.update_vm_config(&aux_vm_config).is_ok());
+        vm_resources.update_vm_config(&aux_vm_config).unwrap();
+
+        // mem_size_mib incompatible with huge pages configuration
+        aux_vm_config.mem_size_mib = Some(129);
+        aux_vm_config.huge_pages = Some(HugePageConfig::Hugetlbfs2M);
+        assert_eq!(
+            vm_resources.update_vm_config(&aux_vm_config).unwrap_err(),
+            VmConfigError::InvalidMemorySize
+        );
+
+        // mem_size_mib compatible with huge page configuration
+        aux_vm_config.mem_size_mib = Some(2048);
+        // Remove the balloon device config that's added by `default_vm_resources` as it would
+        // trigger the "ballooning incompatible with huge pages" check.
+        vm_resources.balloon = BalloonBuilder::new();
+        vm_resources.update_vm_config(&aux_vm_config).unwrap();
     }
 
     #[test]
@@ -1406,7 +1464,34 @@ mod tests {
         let mut vm_resources = default_vm_resources();
         vm_resources.balloon = BalloonBuilder::new();
         new_balloon_cfg.amount_mib = 256;
-        assert!(vm_resources.set_balloon_device(new_balloon_cfg).is_err());
+        vm_resources
+            .set_balloon_device(new_balloon_cfg)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn test_negative_restore_balloon_device_with_huge_pages() {
+        let mut vm_resources = default_vm_resources();
+        vm_resources.balloon = BalloonBuilder::new();
+        vm_resources
+            .update_vm_config(&MachineConfigUpdate {
+                huge_pages: Some(HugePageConfig::Hugetlbfs2M),
+                ..Default::default()
+            })
+            .unwrap();
+        let err = vm_resources
+            .update_from_restored_device(SharedDeviceType::Balloon(Arc::new(Mutex::new(
+                Balloon::new(128, false, 0, true).unwrap(),
+            ))))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ResourcesError::BalloonDevice(BalloonConfigError::HugePages)
+            ),
+            "{:?}",
+            err
+        );
     }
 
     #[test]
@@ -1425,15 +1510,6 @@ mod tests {
     }
 
     #[test]
-    fn test_boot_config() {
-        let vm_resources = default_vm_resources();
-        let expected_boot_cfg = vm_resources.boot_source.builder.as_ref().unwrap();
-        let actual_boot_cfg = vm_resources.boot_source_builder().unwrap();
-
-        assert!(actual_boot_cfg == expected_boot_cfg);
-    }
-
-    #[test]
     fn test_set_boot_source() {
         let tmp_file = TempFile::new().unwrap();
         let cmdline = "reboot=k panic=1 pci=off nomodule 8250.nr_uarts=0";
@@ -1444,7 +1520,7 @@ mod tests {
         };
 
         let mut vm_resources = default_vm_resources();
-        let boot_builder = vm_resources.boot_source_builder().unwrap();
+        let boot_builder = vm_resources.boot_source.builder.as_ref().unwrap();
         let tmp_ino = tmp_file.as_file().metadata().unwrap().st_ino();
 
         assert_ne!(
@@ -1453,7 +1529,7 @@ mod tests {
                 .as_cstring()
                 .unwrap()
                 .as_bytes_with_nul(),
-            [cmdline.as_bytes(), &[b'\0']].concat()
+            [cmdline.as_bytes(), b"\0"].concat()
         );
         assert_ne!(
             boot_builder.kernel_file.metadata().unwrap().st_ino(),
@@ -1471,14 +1547,14 @@ mod tests {
         );
 
         vm_resources.build_boot_source(expected_boot_cfg).unwrap();
-        let boot_source_builder = vm_resources.boot_source_builder().unwrap();
+        let boot_source_builder = vm_resources.boot_source.builder.unwrap();
         assert_eq!(
             boot_source_builder
                 .cmdline
                 .as_cstring()
                 .unwrap()
                 .as_bytes_with_nul(),
-            [cmdline.as_bytes(), &[b'\0']].concat()
+            [cmdline.as_bytes(), b"\0"].concat()
         );
         assert_eq!(
             boot_source_builder.kernel_file.metadata().unwrap().st_ino(),
@@ -1502,10 +1578,10 @@ mod tests {
         let (mut new_block_device_cfg, _file) = default_block_cfg();
         let tmp_file = TempFile::new().unwrap();
         new_block_device_cfg.drive_id = "block2".to_string();
-        new_block_device_cfg.path_on_host = tmp_file.as_path().to_str().unwrap().to_string();
-        assert_eq!(vm_resources.block.list.len(), 1);
+        new_block_device_cfg.path_on_host = Some(tmp_file.as_path().to_str().unwrap().to_string());
+        assert_eq!(vm_resources.block.devices.len(), 1);
         vm_resources.set_block_device(new_block_device_cfg).unwrap();
-        assert_eq!(vm_resources.block.list.len(), 2);
+        assert_eq!(vm_resources.block.devices.len(), 2);
     }
 
     #[test]

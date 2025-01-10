@@ -7,27 +7,27 @@ use std::num::Wrapping;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use snapshot::Persist;
-use utils::vm_memory::address::Address;
-use utils::vm_memory::{GuestAddress, GuestMemoryMmap};
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
-use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use serde::{Deserialize, Serialize};
 
-use super::device::*;
-use super::queue::*;
-use crate::devices::virtio::MmioTransport;
+use super::queue::QueueError;
+use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use crate::devices::virtio::mmio::MmioTransport;
+use crate::devices::virtio::queue::Queue;
+use crate::snapshot::Persist;
+use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 /// Errors thrown during restoring virtio state.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum PersistError {
     /// Snapshot state contains invalid queue info.
     InvalidInput,
+    /// Could not restore queue.
+    QueueConstruction(QueueError),
 }
 
 /// Queue information saved in snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Versionize)]
-// NOTICE: Any changes to this structure require a snapshot version bump.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueState {
     /// The maximal size in elements offered by the device
     max_size: u16,
@@ -51,48 +51,67 @@ pub struct QueueState {
     next_used: Wrapping<u16>,
 
     /// The number of added used buffers since last guest kick
-    #[version(start = 2)]
     num_added: Wrapping<u16>,
+}
+
+/// Auxiliary structure for restoring queues.
+#[derive(Debug, Clone)]
+pub struct QueueConstructorArgs {
+    /// Pointer to guest memory.
+    pub mem: GuestMemoryMmap,
+    /// Is device this queue belong to activated
+    pub is_activated: bool,
 }
 
 impl Persist<'_> for Queue {
     type State = QueueState;
-    type ConstructorArgs = ();
-    type Error = ();
+    type ConstructorArgs = QueueConstructorArgs;
+    type Error = QueueError;
 
     fn save(&self) -> Self::State {
         QueueState {
             max_size: self.max_size,
             size: self.size,
             ready: self.ready,
-            desc_table: self.desc_table.0,
-            avail_ring: self.avail_ring.0,
-            used_ring: self.used_ring.0,
+            desc_table: self.desc_table_address.0,
+            avail_ring: self.avail_ring_address.0,
+            used_ring: self.used_ring_address.0,
             next_avail: self.next_avail,
             next_used: self.next_used,
             num_added: self.num_added,
         }
     }
 
-    fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        Ok(Queue {
+    fn restore(
+        constructor_args: Self::ConstructorArgs,
+        state: &Self::State,
+    ) -> Result<Self, Self::Error> {
+        let mut queue = Queue {
             max_size: state.max_size,
             size: state.size,
             ready: state.ready,
-            desc_table: GuestAddress::new(state.desc_table),
-            avail_ring: GuestAddress::new(state.avail_ring),
-            used_ring: GuestAddress::new(state.used_ring),
+            desc_table_address: GuestAddress(state.desc_table),
+            avail_ring_address: GuestAddress(state.avail_ring),
+            used_ring_address: GuestAddress(state.used_ring),
+
+            desc_table_ptr: std::ptr::null(),
+            avail_ring_ptr: std::ptr::null_mut(),
+            used_ring_ptr: std::ptr::null_mut(),
+
             next_avail: state.next_avail,
             next_used: state.next_used,
             uses_notif_suppression: false,
             num_added: state.num_added,
-        })
+        };
+        if constructor_args.is_activated {
+            queue.initialize(&constructor_args.mem)?;
+        }
+        Ok(queue)
     }
 }
 
 /// State of a VirtioDevice.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Versionize)]
-// NOTICE: Any changes to this structure require a snapshot version bump.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtioDeviceState {
     /// Device type.
     pub device_type: u32,
@@ -103,7 +122,7 @@ pub struct VirtioDeviceState {
     /// List of queues.
     pub queues: Vec<QueueState>,
     /// The MMIO interrupt status.
-    pub interrupt_status: usize,
+    pub interrupt_status: u32,
     /// Flag for activated status.
     pub activated: bool,
 }
@@ -142,18 +161,24 @@ impl VirtioDeviceState {
         }
 
         let uses_notif_suppression = (self.acked_features & 1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
+        let queue_construction_args = QueueConstructorArgs {
+            mem: mem.clone(),
+            is_activated: self.activated,
+        };
         let queues: Vec<Queue> = self
             .queues
             .iter()
             .map(|queue_state| {
-                // Safe to unwrap, `Queue::restore` has no error case.
-                let mut queue = Queue::restore((), queue_state).unwrap();
-                if uses_notif_suppression {
-                    queue.enable_notif_suppression();
-                }
-                queue
+                Queue::restore(queue_construction_args.clone(), queue_state)
+                    .map(|mut queue| {
+                        if uses_notif_suppression {
+                            queue.enable_notif_suppression();
+                        }
+                        queue
+                    })
+                    .map_err(PersistError::QueueConstruction)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         for q in &queues {
             // Sanity check queue size and queue max size.
@@ -173,8 +198,7 @@ impl VirtioDeviceState {
 }
 
 /// Transport information saved in snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Versionize)]
-// NOTICE: Any changes to this structure require a snapshot version bump.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MmioTransportState {
     // The register where feature bits are stored.
     features_select: u32,
@@ -192,6 +216,8 @@ pub struct MmioTransportConstructorArgs {
     pub mem: GuestMemoryMmap,
     /// Device associated with the current MMIO state.
     pub device: Arc<Mutex<dyn VirtioDevice>>,
+    /// Is device backed by vhost-user.
+    pub is_vhost_user: bool,
 }
 
 impl Persist<'_> for MmioTransport {
@@ -213,7 +239,11 @@ impl Persist<'_> for MmioTransport {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mut transport = MmioTransport::new(constructor_args.mem, constructor_args.device);
+        let mut transport = MmioTransport::new(
+            constructor_args.mem,
+            constructor_args.device,
+            constructor_args.is_vhost_user,
+        );
         transport.features_select = state.features_select;
         transport.acked_features_select = state.acked_features_select;
         transport.queue_select = state.queue_select;
@@ -225,14 +255,18 @@ impl Persist<'_> for MmioTransport {
 
 #[cfg(test)]
 mod tests {
-    use utils::tempfile::TempFile;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::devices::virtio::block::device::FileEngineType;
-    use crate::devices::virtio::block::test_utils::default_block_with_path;
+    use crate::devices::virtio::block::virtio::device::FileEngineType;
+    use crate::devices::virtio::block::virtio::test_utils::default_block_with_path;
+    use crate::devices::virtio::block::virtio::VirtioBlock;
     use crate::devices::virtio::mmio::tests::DummyDevice;
+    use crate::devices::virtio::net::test_utils::default_net;
+    use crate::devices::virtio::net::Net;
     use crate::devices::virtio::test_utils::default_mem;
-    use crate::devices::virtio::{net, Block, Net, Vsock, VsockUnixBackend};
+    use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+    use crate::snapshot::Snapshot;
 
     const DEFAULT_QUEUE_MAX_SIZE: u16 = 256;
     impl Default for QueueState {
@@ -312,38 +346,34 @@ mod tests {
 
     #[test]
     fn test_queue_persistence() {
-        let queue = Queue::new(128);
+        let mem = default_mem();
 
-        let mut mem = vec![0; 4096];
-        let version_map = VersionMap::new();
+        let mut queue = Queue::new(128);
+        queue.initialize(&mem).unwrap();
 
-        queue
-            .save()
-            .serialize(&mut mem.as_mut_slice(), &version_map, 1)
-            .unwrap();
+        let mut bytes = vec![0; 4096];
 
-        let restored_queue = Queue::restore(
-            (),
-            &QueueState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
-        )
-        .unwrap();
+        Snapshot::serialize(&mut bytes.as_mut_slice(), &queue.save()).unwrap();
+
+        let ca = QueueConstructorArgs {
+            mem,
+            is_activated: true,
+        };
+        let restored_queue =
+            Queue::restore(ca, &Snapshot::deserialize(&mut bytes.as_slice()).unwrap()).unwrap();
 
         assert_eq!(restored_queue, queue);
     }
 
     #[test]
-    fn test_virtio_device_state_versionize() {
+    fn test_virtio_device_state_serde() {
         let dummy = DummyDevice::new();
         let mut mem = vec![0; 4096];
-        let version_map = VersionMap::new();
 
         let state = VirtioDeviceState::from_device(&dummy);
-        state
-            .serialize(&mut mem.as_mut_slice(), &version_map, 1)
-            .unwrap();
+        Snapshot::serialize(&mut mem.as_mut_slice(), &state).unwrap();
 
-        let restored_state =
-            VirtioDeviceState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap();
+        let restored_state: VirtioDeviceState = Snapshot::deserialize(&mut mem.as_slice()).unwrap();
         assert_eq!(restored_state, state);
     }
 
@@ -368,24 +398,24 @@ mod tests {
         device: Arc<Mutex<dyn VirtioDevice>>,
     ) {
         let mut buf = vec![0; 4096];
-        let version_map = VersionMap::new();
 
-        mmio_transport
-            .save()
-            .serialize(&mut buf.as_mut_slice(), &version_map, 1)
-            .unwrap();
+        Snapshot::serialize(&mut buf.as_mut_slice(), &mmio_transport.save()).unwrap();
 
-        let restore_args = MmioTransportConstructorArgs { mem, device };
+        let restore_args = MmioTransportConstructorArgs {
+            mem,
+            device,
+            is_vhost_user: false,
+        };
         let restored_mmio_transport = MmioTransport::restore(
             restore_args,
-            &MmioTransportState::deserialize(&mut buf.as_slice(), &version_map, 1).unwrap(),
+            &Snapshot::deserialize(&mut buf.as_slice()).unwrap(),
         )
         .unwrap();
 
         assert_eq!(restored_mmio_transport, mmio_transport);
     }
 
-    fn default_block() -> (MmioTransport, GuestMemoryMmap, Arc<Mutex<Block>>) {
+    fn create_default_block() -> (MmioTransport, GuestMemoryMmap, Arc<Mutex<VirtioBlock>>) {
         let mem = default_mem();
 
         // Create backing file.
@@ -396,15 +426,15 @@ mod tests {
             FileEngineType::default(),
         );
         let block = Arc::new(Mutex::new(block));
-        let mmio_transport = MmioTransport::new(mem.clone(), block.clone());
+        let mmio_transport = MmioTransport::new(mem.clone(), block.clone(), false);
 
         (mmio_transport, mem, block)
     }
 
-    fn default_net() -> (MmioTransport, GuestMemoryMmap, Arc<Mutex<Net>>) {
+    fn create_default_net() -> (MmioTransport, GuestMemoryMmap, Arc<Mutex<Net>>) {
         let mem = default_mem();
-        let net = Arc::new(Mutex::new(net::test_utils::default_net()));
-        let mmio_transport = MmioTransport::new(mem.clone(), net.clone());
+        let net = Arc::new(Mutex::new(default_net()));
+        let mmio_transport = MmioTransport::new(mem.clone(), net.clone(), false);
 
         (mmio_transport, mem, net)
     }
@@ -424,20 +454,20 @@ mod tests {
         let backend = VsockUnixBackend::new(guest_cid, uds_path).unwrap();
         let vsock = Vsock::new(guest_cid, backend).unwrap();
         let vsock = Arc::new(Mutex::new(vsock));
-        let mmio_transport = MmioTransport::new(mem.clone(), vsock.clone());
+        let mmio_transport = MmioTransport::new(mem.clone(), vsock.clone(), false);
 
         (mmio_transport, mem, vsock)
     }
 
     #[test]
     fn test_block_over_mmiotransport_persistence() {
-        let (mmio_transport, mem, block) = default_block();
+        let (mmio_transport, mem, block) = create_default_block();
         generic_mmiotransport_persistence_test(mmio_transport, mem, block);
     }
 
     #[test]
     fn test_net_over_mmiotransport_persistence() {
-        let (mmio_transport, mem, net) = default_net();
+        let (mmio_transport, mem, net) = create_default_net();
         generic_mmiotransport_persistence_test(mmio_transport, mem, net);
     }
 

@@ -1,6 +1,7 @@
 # Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Optional benchmarks-do-not-regress test"""
+import contextlib
 import json
 import logging
 import platform
@@ -10,14 +11,14 @@ from pathlib import Path
 import pytest
 
 from framework import utils
-from framework.ab_test import chdir, git_ab_test
+from framework.ab_test import git_ab_test
 from host_tools.cargo_build import cargo
 
 LOGGER = logging.getLogger(__name__)
 
 
 @pytest.mark.no_block_pr
-@pytest.mark.timeout(600)
+@pytest.mark.timeout(900)
 def test_no_regression_relative_to_target_branch():
     """
     Run the microbenchmarks in this repository, comparing results from pull
@@ -32,7 +33,7 @@ def run_criterion(firecracker_checkout: Path, is_a: bool) -> Path:
     """
     baseline_name = "a_baseline" if is_a else "b_baseline"
 
-    with chdir(firecracker_checkout):
+    with contextlib.chdir(firecracker_checkout):
         # Passing --message-format json to cargo tells it to print its log in a json format. At the end, instead of the
         # usual "placed executable <...> at <...>" we'll get a json object with an 'executable' key, from which we
         # extract the path to the compiled benchmark binary.
@@ -50,7 +51,7 @@ def run_criterion(firecracker_checkout: Path, is_a: bool) -> Path:
                     executables.append(executable)
 
         for executable in executables:
-            utils.run_cmd(
+            utils.check_output(
                 f"CARGO_TARGET_DIR=build/cargo_target taskset -c 1 {executable} --bench --save-baseline {baseline_name}"
             )
 
@@ -79,7 +80,7 @@ def compare_results(location_a_baselines: Path, location_b_baselines: Path):
     _, stdout, _ = cargo(
         "bench",
         f"--all --target {platform.machine()}-unknown-linux-musl",
-        "--load-baseline a_baseline --baseline b_baseline",
+        "--baseline a_baseline --load-baseline b_baseline",
     )
 
     regressions_only = "\n\n".join(

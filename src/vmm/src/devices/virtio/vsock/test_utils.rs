@@ -6,17 +6,20 @@
 
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use utils::epoll::EventSet;
-use utils::eventfd::EventFd;
-use utils::vm_memory::{GuestAddress, GuestMemoryMmap};
+use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::eventfd::EventFd;
 
-use crate::devices::virtio::test_utils::{single_region_mem, VirtQueue as GuestQ};
+use super::packet::{VsockPacketRx, VsockPacketTx};
+use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::devices::virtio::test_utils::VirtQueue as GuestQ;
 use crate::devices::virtio::vsock::device::{RXQ_INDEX, TXQ_INDEX};
-use crate::devices::virtio::vsock::packet::{VsockPacket, VSOCK_PKT_HDR_SIZE};
-use crate::devices::virtio::{
-    VirtioDevice, Vsock, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
-    VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+use crate::devices::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+use crate::devices::virtio::vsock::{
+    Vsock, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
 };
+use crate::test_utils::single_region_mem;
+use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 #[derive(Debug)]
 pub struct TestBackend {
@@ -60,16 +63,16 @@ impl Default for TestBackend {
 }
 
 impl VsockChannel for TestBackend {
-    fn recv_pkt(&mut self, pkt: &mut VsockPacket, mem: &GuestMemoryMmap) -> Result<(), VsockError> {
+    fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError> {
         let cool_buf = [0xDu8, 0xE, 0xA, 0xD, 0xB, 0xE, 0xE, 0xF];
         match self.rx_err.take() {
             None => {
                 let buf_size = pkt.buf_size();
                 if buf_size > 0 {
                     let buf: Vec<u8> = (0..buf_size)
-                        .map(|i| cool_buf[i % cool_buf.len()])
+                        .map(|i| cool_buf[i as usize % cool_buf.len()])
                         .collect();
-                    pkt.read_at_offset_from(mem, 0, &mut buf.as_slice(), buf_size)
+                    pkt.read_at_offset_from(&mut buf.as_slice(), 0, buf_size)
                         .unwrap();
                 }
                 self.rx_ok_cnt += 1;
@@ -79,7 +82,7 @@ impl VsockChannel for TestBackend {
         }
     }
 
-    fn send_pkt(&mut self, _pkt: &VsockPacket, _mem: &GuestMemoryMmap) -> Result<(), VsockError> {
+    fn send_pkt(&mut self, _pkt: &VsockPacketTx) -> Result<(), VsockError> {
         match self.tx_err.take() {
             None => {
                 self.tx_ok_cnt += 1;
@@ -144,7 +147,7 @@ impl TestContext {
         // Set up one available descriptor in the RX queue.
         guest_rxvq.dtable[0].set(
             0x0040_0000,
-            VSOCK_PKT_HDR_SIZE as u32,
+            VSOCK_PKT_HDR_SIZE,
             VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
             1,
         );
@@ -154,10 +157,14 @@ impl TestContext {
         guest_rxvq.avail.idx.set(1);
 
         // Set up one available descriptor in the TX queue.
-        guest_txvq.dtable[0].set(0x0050_0000, VSOCK_PKT_HDR_SIZE as u32, VIRTQ_DESC_F_NEXT, 1);
-        guest_txvq.dtable[1].set(0x0050_1000, 4096, 0, 0);
+        guest_txvq.dtable[0].set(0x0040_0000, VSOCK_PKT_HDR_SIZE, VIRTQ_DESC_F_NEXT, 1);
+        guest_txvq.dtable[1].set(0x0040_1000, 4096, 0, 0);
         guest_txvq.avail.ring[0].set(0);
         guest_txvq.avail.idx.set(1);
+
+        // Both descriptors above point to the same area of guest memory, to work around
+        // the fact that through the TX queue, the memory is read-only, and through the RX queue,
+        // the memory is write-only.
 
         let queues = vec![rxvq, txvq, evvq];
         EventHandlerContext {
@@ -183,7 +190,7 @@ pub struct EventHandlerContext<'a> {
     pub guest_evvq: GuestQ<'a>,
 }
 
-impl<'a> EventHandlerContext<'a> {
+impl EventHandlerContext<'_> {
     pub fn mock_activate(&mut self, mem: GuestMemoryMmap) {
         // Artificially activate the device.
         self.device.activate(mem).unwrap();
@@ -200,9 +207,9 @@ impl<'a> EventHandlerContext<'a> {
 }
 
 #[cfg(test)]
-pub fn read_packet_data(pkt: &VsockPacket, mem: &GuestMemoryMmap, how_much: usize) -> Vec<u8> {
-    let mut buf = vec![0; how_much];
-    pkt.write_from_offset_to(mem, 0, &mut buf.as_mut_slice(), how_much)
+pub fn read_packet_data(pkt: &VsockPacketTx, how_much: u32) -> Vec<u8> {
+    let mut buf = vec![0; how_much as usize];
+    pkt.write_from_offset_to(&mut buf.as_mut_slice(), 0, how_much)
         .unwrap();
     buf
 }

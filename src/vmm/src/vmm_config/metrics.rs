@@ -17,10 +17,9 @@ pub struct MetricsConfig {
 }
 
 /// Errors associated with actions on the `MetricsConfig`.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MetricsConfigError {
-    /// Cannot initialize the metrics system due to bad user input.
-    #[error("{}", format!("{:?}", .0).replace('\"', ""))]
+    /// Cannot initialize the metrics system due to bad user input: {0}
     InitializationFailure(String),
 }
 
@@ -37,7 +36,7 @@ pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError
 
 #[cfg(test)]
 mod tests {
-    use utils::tempfile::TempFile;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
 
@@ -47,7 +46,7 @@ mod tests {
         let desc = MetricsConfig {
             metrics_path: PathBuf::from("not_found_file_metrics"),
         };
-        assert!(init_metrics(desc).is_err());
+        init_metrics(desc).unwrap_err();
 
         // Initializing metrics with valid pipe is ok.
         let metrics_file = TempFile::new().unwrap();
@@ -55,7 +54,7 @@ mod tests {
             metrics_path: metrics_file.as_path().to_path_buf(),
         };
 
-        assert!(init_metrics(desc.clone()).is_ok());
-        assert!(init_metrics(desc).is_err());
+        init_metrics(desc.clone()).unwrap();
+        init_metrics(desc).unwrap_err();
     }
 }

@@ -27,7 +27,6 @@ const GICR_IPRIORITYR0: SimpleReg = SimpleReg::new(GICR_SGI_OFFSET + 0x0400, 32)
 const GICR_ICFGR0: SimpleReg = SimpleReg::new(GICR_SGI_OFFSET + 0x0C00, 8);
 
 // List with relevant redistributor registers that we will be restoring.
-// NOTICE: Any changes to this structure require a snapshot version bump.
 static VGIC_RDIST_REGS: &[SimpleReg] = &[
     GICR_CTLR,
     GICR_STATUSR,
@@ -37,7 +36,6 @@ static VGIC_RDIST_REGS: &[SimpleReg] = &[
 ];
 
 // List with relevant SGI associated redistributor registers that we will be restoring.
-// NOTICE: Any changes to this structure require a snapshot version bump.
 static VGIC_SGI_REGS: &[SimpleReg] = &[
     GICR_IGROUPR0,
     GICR_ICENABLER0,
@@ -104,26 +102,26 @@ mod tests {
 
         let gicr_typer = 123;
         let res = get_redist_regs(gic_fd.device_fd(), gicr_typer);
-        assert!(res.is_ok());
         let state = res.unwrap();
         assert_eq!(state.len(), 14);
 
-        assert!(set_redist_regs(gic_fd.device_fd(), gicr_typer, &state).is_ok());
+        set_redist_regs(gic_fd.device_fd(), gicr_typer, &state).unwrap();
 
         unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
 
         let res = set_redist_regs(gic_fd.device_fd(), gicr_typer, &state);
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), true, 5)"
         );
 
         let res = get_redist_regs(gic_fd.device_fd(), gicr_typer);
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 5)"
         );
+
+        // dropping gic_fd would double close the gic fd, so leak it
+        std::mem::forget(gic_fd);
     }
 }

@@ -7,7 +7,8 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use fc_utils::seek_hole::SeekHole;
+use vmm::utils::u64_to_usize;
+use vmm_sys_util::seek_hole::SeekHole;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum EditMemoryError {
@@ -23,13 +24,13 @@ pub enum EditMemoryError {
     MetadataDiff(std::io::Error),
     /// Failed to seek in memory file: {0}
     SeekMemory(std::io::Error),
-    /// Failed to send the file: {0:?}
+    /// Failed to send the file: {0}
     SendFile(std::io::Error),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum EditMemorySubCommand {
-    /// Remove registers from vcpu states.
+    /// Apply a diff snapshot on top of a base one
     Rebase {
         /// Path to the memory file.
         #[arg(short, long)]
@@ -89,7 +90,7 @@ fn rebase(memory_path: PathBuf, diff_path: PathBuf) -> Result<(), EditMemoryErro
                     base_file.as_raw_fd(),
                     diff_file.as_raw_fd(),
                     (&mut cursor as *mut u64).cast::<i64>(),
-                    block_end.saturating_sub(cursor) as usize,
+                    u64_to_usize(block_end.saturating_sub(cursor)),
                 )
             };
             if num_transferred_bytes < 0 {
@@ -107,14 +108,14 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::fs::FileExt;
 
-    use fc_utils::{rand, tempfile};
+    use vmm_sys_util::{rand, tempfile};
 
     use super::*;
 
     fn check_file_content(file: &File, expected_content: &[u8]) {
         assert_eq!(
-            file.metadata().unwrap().len() as usize,
-            expected_content.len()
+            file.metadata().unwrap().len(),
+            expected_content.len() as u64
         );
         let mut buf = vec![0u8; expected_content.len()];
         file.read_exact_at(buf.as_mut_slice(), 0).unwrap();
@@ -210,7 +211,7 @@ mod tests {
             let base_block = rand::rand_bytes(block_size);
             base_file.write_all(&base_block).unwrap();
             diff_file
-                .seek(SeekFrom::Current(block_size as i64))
+                .seek(SeekFrom::Current(i64::try_from(block_size).unwrap()))
                 .unwrap();
             expected_result.extend(base_block);
 

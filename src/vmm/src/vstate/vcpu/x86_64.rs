@@ -5,7 +5,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeMap;
+use std::fmt::Debug;
 
 use kvm_bindings::{
     kvm_debugregs, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
@@ -13,15 +14,16 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use log::{error, warn};
-use utils::vm_memory::{Address, GuestAddress, GuestMemoryMmap};
-use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
-use versionize_derive::Versionize;
+use serde::{Deserialize, Serialize};
+use vmm_sys_util::fam;
 
+use crate::arch::x86_64::gen::msr_index::{MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE};
 use crate::arch::x86_64::interrupts;
 use crate::arch::x86_64::msr::{create_boot_msr_entries, MsrError};
 use crate::arch::x86_64::regs::{SetupFpuError, SetupRegistersError, SetupSpecialRegistersError};
 use crate::cpu_config::x86_64::{cpuid, CpuConfiguration};
 use crate::logger::{IncMetric, METRICS};
+use crate::vstate::memory::{Address, GuestAddress, GuestMemoryMmap};
 use crate::vstate::vcpu::{VcpuConfig, VcpuEmulation};
 use crate::vstate::vm::Vm;
 
@@ -29,25 +31,28 @@ use crate::vstate::vm::Vm;
 // The value of 250 parts per million is based on
 // the QEMU approach, more details here:
 // https://bugzilla.redhat.com/show_bug.cgi?id=1839095
-const TSC_KHZ_TOL: f64 = 250.0 / 1_000_000.0;
+const TSC_KHZ_TOL_NUMERATOR: i64 = 250;
+const TSC_KHZ_TOL_DENOMINATOR: i64 = 1_000_000;
+
+/// A set of MSRs that should be restored separately after all other MSRs have already been restored
+const DEFERRED_MSRS: [u32; 1] = [
+    // MSR_IA32_TSC_DEADLINE must be restored after MSR_IA32_TSC, otherwise we risk "losing" timer
+    // interrupts across the snapshot restore boundary (due to KVM querying MSR_IA32_TSC upon
+    // writes to the TSC_DEADLINE MSR to determine whether it needs to prime a timer - if
+    // MSR_IA32_TSC is not initialized correctly, it can wrongly assume no timer needs to be
+    // primed, or the timer can be initialized with a wrong expiry).
+    MSR_IA32_TSC_DEADLINE,
+];
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum KvmVcpuError {
     /// Failed to convert `kvm_bindings::CpuId` to `Cpuid`: {0}
     ConvertCpuidType(#[from] cpuid::CpuidTryFromKvmCpuid),
-    /// Failed FamStructWrapper operation: {0:?}
-    Fam(#[from] utils::fam::Error),
-    /// Error configuring the floating point related registers: {0:?}
-    FpuConfiguration(crate::arch::x86_64::regs::RegsError),
+    /// Failed FamStructWrapper operation: {0}
+    Fam(#[from] vmm_sys_util::fam::Error),
     /// Failed to get dumpable MSR index list: {0}
     GetMsrsToDump(#[from] crate::arch::x86_64::msr::MsrError),
-    /// Cannot set the local interruption due to bad configuration: {0:?}
-    LocalIntConfiguration(crate::arch::x86_64::interrupts::InterruptError),
-    /// Error configuring the general purpose registers: {0:?}
-    RegsConfiguration(crate::arch::x86_64::regs::RegsError),
-    /// Error configuring the special registers: {0:?}
-    SregsConfiguration(crate::arch::x86_64::regs::RegsError),
     /// Cannot open the VCPU file descriptor: {0}
     VcpuFd(kvm_ioctls::Error),
     /// Failed to get KVM vcpu debug regs: {0}
@@ -56,8 +61,8 @@ pub enum KvmVcpuError {
     VcpuGetLapic(kvm_ioctls::Error),
     /// Failed to get KVM vcpu mp state: {0}
     VcpuGetMpState(kvm_ioctls::Error),
-    /// Unexpected number of MSRS reported by the kernel
-    VcpuGetMsrsIncomplete,
+    /// Failed to get KVM vcpu msr: {0:#x}
+    VcpuGetMsr(u32),
     /// Failed to get KVM vcpu msrs: {0}
     VcpuGetMsrs(kvm_ioctls::Error),
     /// Failed to get KVM vcpu regs: {0}
@@ -96,16 +101,12 @@ pub enum KvmVcpuError {
     VcpuSetXcrs(kvm_ioctls::Error),
     /// Failed to set KVM vcpu xsave: {0}
     VcpuSetXsave(kvm_ioctls::Error),
-    /// Failed to set KVM TSC frequency: {0}
-    VcpuSetTsc(kvm_ioctls::Error),
-    /// Failed to apply CPU template
-    VcpuTemplateError,
 }
 
 /// Error type for [`KvmVcpu::get_tsc_khz`] and [`KvmVcpu::is_tsc_scaling_required`].
 #[derive(Debug, thiserror::Error, derive_more::From, Eq, PartialEq)]
 #[error("{0}")]
-pub struct GetTscError(utils::errno::Error);
+pub struct GetTscError(vmm_sys_util::errno::Error);
 
 /// Error type for [`KvmVcpu::set_tsc_khz`].
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -116,11 +117,11 @@ pub struct SetTscError(#[from] kvm_ioctls::Error);
 #[derive(Debug, thiserror::Error, displaydoc::Display, Eq, PartialEq)]
 pub enum KvmVcpuConfigureError {
     /// Failed to convert `Cpuid` to `kvm_bindings::CpuId`: {0}
-    ConvertCpuidType(#[from] utils::fam::Error),
+    ConvertCpuidType(#[from] vmm_sys_util::fam::Error),
     /// Failed to apply modifications to CPUID: {0}
     NormalizeCpuidError(#[from] cpuid::NormalizeCpuidError),
     /// Failed to set CPUID: {0}
-    SetCpuid(#[from] utils::errno::Error),
+    SetCpuid(#[from] vmm_sys_util::errno::Error),
     /// Failed to set MSRs: {0}
     SetMsrs(#[from] MsrError),
     /// Failed to setup registers: {0}
@@ -140,11 +141,20 @@ pub struct KvmVcpu {
     pub index: u8,
     /// KVM vcpu fd.
     pub fd: VcpuFd,
+    /// Vcpu peripherals, such as buses
+    pub(super) peripherals: Peripherals,
+    /// The list of MSRs to include in a VM snapshot, in the same order as KVM returned them
+    /// from KVM_GET_MSR_INDEX_LIST
+    msrs_to_save: Vec<u32>,
+}
+
+/// Vcpu peripherals
+#[derive(Default, Debug)]
+pub(super) struct Peripherals {
     /// Pio bus.
     pub pio_bus: Option<crate::devices::Bus>,
     /// Mmio bus.
     pub mmio_bus: Option<crate::devices::Bus>,
-    msrs_to_save: HashSet<u32>,
 }
 
 impl KvmVcpu {
@@ -163,9 +173,8 @@ impl KvmVcpu {
         Ok(KvmVcpu {
             index,
             fd: kvm_vcpu,
-            pio_bus: None,
-            mmio_bus: None,
-            msrs_to_save: vm.msrs_to_save().as_slice().iter().copied().collect(),
+            peripherals: Default::default(),
+            msrs_to_save: vm.msrs_to_save().as_slice().to_vec(),
         })
     }
 
@@ -250,7 +259,7 @@ impl KvmVcpu {
 
     /// Sets a Port Mapped IO bus for this vcpu.
     pub fn set_pio_bus(&mut self, pio_bus: crate::devices::Bus) {
-        self.pio_bus = Some(pio_bus);
+        self.peripherals.pio_bus = Some(pio_bus);
     }
 
     /// Get the current TSC frequency for this vCPU.
@@ -287,15 +296,81 @@ impl KvmVcpu {
         Ok(cpuid)
     }
 
+    /// If the IA32_TSC_DEADLINE MSR value is zero, update it
+    /// with the IA32_TSC value to guarantee that
+    /// the vCPU will continue receiving interrupts after restoring from a snapshot.
+    ///
+    /// Rationale: we observed that sometimes when taking a snapshot,
+    /// the IA32_TSC_DEADLINE MSR is cleared, but the interrupt is not
+    /// delivered to the guest, leading to a situation where one
+    /// of the vCPUs never receives TSC interrupts after restoring,
+    /// until the MSR is updated externally, eg by setting the system time.
+    fn fix_zero_tsc_deadline_msr(msr_chunks: &mut [Msrs]) {
+        // We do not expect more than 1 TSC MSR entry, but if there are multiple, pick the maximum.
+        let max_tsc_value = msr_chunks
+            .iter()
+            .flat_map(|msrs| msrs.as_slice())
+            .filter(|msr| msr.index == MSR_IA32_TSC)
+            .map(|msr| msr.data)
+            .max();
+
+        if let Some(tsc_value) = max_tsc_value {
+            msr_chunks
+                .iter_mut()
+                .flat_map(|msrs| msrs.as_mut_slice())
+                .filter(|msr| msr.index == MSR_IA32_TSC_DEADLINE && msr.data == 0)
+                .for_each(|msr| {
+                    warn!(
+                        "MSR_IA32_TSC_DEADLINE is 0, replacing with {:#x}.",
+                        tsc_value
+                    );
+                    msr.data = tsc_value;
+                });
+        }
+    }
+
+    /// Looks for MSRs from the [`DEFERRED_MSRS`] array and removes them from `msr_chunks`.
+    /// Returns a new [`Msrs`] object containing all the removed MSRs.
+    ///
+    /// We use this to capture some causal dependencies between MSRs where the relative order
+    /// of restoration matters (e.g. MSR_IA32_TSC must be restored before MSR_IA32_TSC_DEADLINE).
+    fn extract_deferred_msrs(msr_chunks: &mut [Msrs]) -> Result<Msrs, fam::Error> {
+        // Use 0 here as FamStructWrapper doesn't really give an equivalent of `Vec::with_capacity`,
+        // and if we specify something N != 0 here, then it will create a FamStructWrapper with N
+        // elements pre-allocated and zero'd out. Unless we then actually "fill" all those N values,
+        // KVM will later yell at us about invalid MSRs.
+        let mut deferred_msrs = Msrs::new(0)?;
+
+        for msrs in msr_chunks {
+            msrs.retain(|msr| {
+                if DEFERRED_MSRS.contains(&msr.index) {
+                    deferred_msrs
+                        .push(*msr)
+                        .inspect_err(|err| {
+                            error!(
+                                "Failed to move MSR {} into later chunk: {:?}",
+                                msr.index, err
+                            )
+                        })
+                        .is_err()
+                } else {
+                    true
+                }
+            });
+        }
+
+        Ok(deferred_msrs)
+    }
+
     /// Get MSR chunks for the given MSR index list.
     ///
     /// KVM only supports getting `KVM_MAX_MSR_ENTRIES` at a time, so we divide
     /// the list of MSR indices into chunks, call `KVM_GET_MSRS` for each
-    /// chunk, and collect into a Vec<Msrs>.
+    /// chunk, and collect into a [`Vec<Msrs>`].
     ///
     /// # Arguments
     ///
-    /// * `msr_index_list`: List of MSR indices.
+    /// * `msr_index_iter`: Iterator over MSR indices.
     ///
     /// # Errors
     ///
@@ -303,30 +378,71 @@ impl KvmVcpu {
     /// * When [`kvm_ioctls::VcpuFd::get_msrs`] returns errors.
     /// * When the return value of [`kvm_ioctls::VcpuFd::get_msrs`] (the number of entries that
     ///   could be gotten) is less than expected.
-    fn get_msr_chunks(&self, msr_index_list: &[u32]) -> Result<Vec<Msrs>, KvmVcpuError> {
-        let mut msr_chunks: Vec<Msrs> = Vec::new();
+    fn get_msr_chunks(
+        &self,
+        mut msr_index_iter: impl ExactSizeIterator<Item = u32>,
+    ) -> Result<Vec<Msrs>, KvmVcpuError> {
+        let num_chunks = msr_index_iter.len().div_ceil(KVM_MAX_MSR_ENTRIES);
 
-        for msr_index_chunk in msr_index_list.chunks(KVM_MAX_MSR_ENTRIES) {
-            let mut msrs = Msrs::new(msr_index_chunk.len())?;
-            let msr_entries = msrs.as_mut_slice();
-            assert_eq!(msr_index_chunk.len(), msr_entries.len());
-            for (pos, index) in msr_index_chunk.iter().enumerate() {
-                msr_entries[pos].index = *index;
-            }
+        // + 1 for the chunk of deferred MSRs
+        let mut msr_chunks: Vec<Msrs> = Vec::with_capacity(num_chunks + 1);
 
-            let expected_nmsrs = msrs.as_slice().len();
-            let nmsrs = self
-                .fd
-                .get_msrs(&mut msrs)
-                .map_err(KvmVcpuError::VcpuGetMsrs)?;
-            if nmsrs != expected_nmsrs {
-                return Err(KvmVcpuError::VcpuGetMsrsIncomplete);
-            }
-
-            msr_chunks.push(msrs);
+        for _ in 0..num_chunks {
+            let chunk_len = msr_index_iter.len().min(KVM_MAX_MSR_ENTRIES);
+            let chunk = self.get_msr_chunk(&mut msr_index_iter, chunk_len)?;
+            msr_chunks.push(chunk);
         }
 
+        Self::fix_zero_tsc_deadline_msr(&mut msr_chunks);
+
+        let deferred = Self::extract_deferred_msrs(&mut msr_chunks)?;
+        msr_chunks.push(deferred);
+
         Ok(msr_chunks)
+    }
+
+    /// Get single MSR chunk for the given MSR index iterator with
+    /// specified length. Iterator should have enough elements
+    /// to fill the chunk with indices, otherwise KVM will
+    /// return an error when processing half filled chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `msr_index_iter`: Iterator over MSR indices.
+    /// * `chunk_size`: Lenght of a chunk.
+    ///
+    /// # Errors
+    ///
+    /// * When [`kvm_bindings::Msrs::new`] returns errors.
+    /// * When [`kvm_ioctls::VcpuFd::get_msrs`] returns errors.
+    /// * When the return value of [`kvm_ioctls::VcpuFd::get_msrs`] (the number of entries that
+    ///   could be gotten) is less than expected.
+    pub fn get_msr_chunk(
+        &self,
+        msr_index_iter: impl Iterator<Item = u32>,
+        chunk_size: usize,
+    ) -> Result<Msrs, KvmVcpuError> {
+        let chunk_iter = msr_index_iter.take(chunk_size);
+
+        let mut msrs = Msrs::new(chunk_size)?;
+        let msr_entries = msrs.as_mut_slice();
+        for (pos, msr_index) in chunk_iter.enumerate() {
+            msr_entries[pos].index = msr_index;
+        }
+
+        let nmsrs = self
+            .fd
+            .get_msrs(&mut msrs)
+            .map_err(KvmVcpuError::VcpuGetMsrs)?;
+        // GET_MSRS returns a number of successfully set msrs.
+        // If number of set msrs is not equal to the length of
+        // `msrs`, then the value retuned by GET_MSRS can act
+        // as an index to the problematic msr.
+        if nmsrs != chunk_size {
+            Err(KvmVcpuError::VcpuGetMsr(msrs.as_slice()[nmsrs].index))
+        } else {
+            Ok(msrs)
+        }
     }
 
     /// Get MSRs for the given MSR index list.
@@ -338,9 +454,12 @@ impl KvmVcpu {
     /// # Errors
     ///
     /// * When `KvmVcpu::get_msr_chunks()` returns errors.
-    pub fn get_msrs(&self, msr_index_list: &[u32]) -> Result<HashMap<u32, u64>, KvmVcpuError> {
-        let mut msrs: HashMap<u32, u64> = HashMap::new();
-        self.get_msr_chunks(msr_index_list)?
+    pub fn get_msrs(
+        &self,
+        msr_index_iter: impl ExactSizeIterator<Item = u32>,
+    ) -> Result<BTreeMap<u32, u64>, KvmVcpuError> {
+        let mut msrs = BTreeMap::new();
+        self.get_msr_chunks(msr_index_iter)?
             .iter()
             .for_each(|msr_chunk| {
                 msr_chunk.as_slice().iter().for_each(|msr| {
@@ -391,8 +510,7 @@ impl KvmVcpu {
             None
         });
         let cpuid = self.get_cpuid()?;
-        let saved_msrs =
-            self.get_msr_chunks(&self.msrs_to_save.iter().copied().collect::<Vec<_>>())?;
+        let saved_msrs = self.get_msr_chunks(self.msrs_to_save.iter().copied())?;
         let vcpu_events = self
             .fd
             .get_vcpu_events()
@@ -401,7 +519,6 @@ impl KvmVcpu {
         Ok(VcpuState {
             cpuid,
             saved_msrs,
-            msrs: Msrs::new(0)?,
             debug_regs,
             lapic,
             mp_state,
@@ -422,7 +539,7 @@ impl KvmVcpu {
         let cpuid = cpuid::Cpuid::try_from(self.get_cpuid()?)?;
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let msr_index_list = crate::arch::x86_64::msr::get_msrs_to_dump(&kvm)?;
-        let msrs = self.get_msrs(msr_index_list.as_slice())?;
+        let msrs = self.get_msrs(msr_index_list.as_slice().iter().copied())?;
         Ok(CpuConfiguration { cpuid, msrs })
     }
 
@@ -439,7 +556,8 @@ impl KvmVcpu {
         // per million beacuse it is common for TSC frequency
         // to differ due to calibration at boot time.
         let diff = (i64::from(self.get_tsc_khz()?) - i64::from(state_tsc_freq)).abs();
-        Ok(diff > (f64::from(state_tsc_freq) * TSC_KHZ_TOL).round() as i64)
+        // Cannot overflow since u32::MAX * 250 < i64::MAX
+        Ok(diff > i64::from(state_tsc_freq) * TSC_KHZ_TOL_NUMERATOR / TSC_KHZ_TOL_DENOMINATOR)
     }
 
     /// Scale the TSC frequency of this vCPU to the one provided as a parameter.
@@ -505,7 +623,9 @@ impl KvmVcpu {
             .map_err(KvmVcpuError::VcpuSetVcpuEvents)?;
         Ok(())
     }
+}
 
+impl Peripherals {
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
@@ -513,6 +633,7 @@ impl KvmVcpu {
         match exit {
             VcpuExit::IoIn(addr, data) => {
                 if let Some(pio_bus) = &self.pio_bus {
+                    let _metric = METRICS.vcpu.exit_io_in_agg.record_latency_metrics();
                     pio_bus.read(u64::from(addr), data);
                     METRICS.vcpu.exit_io_in.inc();
                 }
@@ -520,6 +641,7 @@ impl KvmVcpu {
             }
             VcpuExit::IoOut(addr, data) => {
                 if let Some(pio_bus) = &self.pio_bus {
+                    let _metric = METRICS.vcpu.exit_io_out_agg.record_latency_metrics();
                     pio_bus.write(u64::from(addr), data);
                     METRICS.vcpu.exit_io_out.inc();
                 }
@@ -539,17 +661,12 @@ impl KvmVcpu {
     }
 }
 
-#[derive(Debug, Clone, Versionize)]
 /// Structure holding VCPU kvm state.
-// NOTICE: Any changes to this structure require a snapshot version bump.
+#[derive(Serialize, Deserialize)]
 pub struct VcpuState {
     /// CpuId.
     pub cpuid: CpuId,
-    /// Msrs.
-    #[version(end = 3, default_fn = "default_msrs")]
-    pub msrs: Msrs,
     /// Saved msrs.
-    #[version(start = 3, de_fn = "de_saved_msrs", ser_fn = "ser_saved_msrs")]
     pub saved_msrs: Vec<Msrs>,
     /// Debug regs.
     pub debug_regs: kvm_debugregs,
@@ -568,63 +685,29 @@ pub struct VcpuState {
     /// Xsave.
     pub xsave: kvm_xsave,
     /// Tsc khz.
-    #[version(start = 2, default_fn = "default_tsc_khz", ser_fn = "ser_tsc")]
     pub tsc_khz: Option<u32>,
 }
 
-impl VcpuState {
-    fn default_tsc_khz(_: u16) -> Option<u32> {
-        warn!("CPU TSC freq not found in snapshot");
-        None
-    }
-
-    fn ser_tsc(&mut self, _target_version: u16) -> VersionizeResult<()> {
-        // v0.24 and older versions do not support TSC scaling.
-        warn!(
-            "Saving to older snapshot version, TSC freq {}",
-            self.tsc_khz
-                .map(|freq| freq.to_string() + "KHz not included in snapshot.")
-                .unwrap_or_else(|| "not available.".to_string())
-        );
-
-        Ok(())
-    }
-
-    fn default_msrs(_source_version: u16) -> Msrs {
-        // Safe to unwrap since Msrs::new() only returns an error if the number
-        // of elements exceeds KVM_MAX_MSR_ENTRIES
-        Msrs::new(0).unwrap()
-    }
-
-    fn de_saved_msrs(&mut self, source_version: u16) -> VersionizeResult<()> {
-        if source_version < 3 {
-            self.saved_msrs.push(self.msrs.clone());
+impl Debug for VcpuState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug_kvm_regs: Vec<kvm_bindings::kvm_msrs> = Vec::new();
+        for kvm_msrs in self.saved_msrs.iter() {
+            debug_kvm_regs = kvm_msrs.clone().into_raw();
+            debug_kvm_regs.sort_by_key(|msr| (msr.nmsrs, msr.pad));
         }
-        Ok(())
-    }
-
-    fn ser_saved_msrs(&mut self, target_version: u16) -> VersionizeResult<()> {
-        match self.saved_msrs.len() {
-            0 => Err(VersionizeError::Serialize(
-                "Cannot serialize MSRs because the MSR list is empty".to_string(),
-            )),
-            1 => {
-                if target_version < 3 {
-                    self.msrs = self.saved_msrs[0].clone();
-                    Ok(())
-                } else {
-                    Err(VersionizeError::Serialize(format!(
-                        "Cannot serialize MSRs to target version {}",
-                        target_version
-                    )))
-                }
-            }
-            _ => Err(VersionizeError::Serialize(
-                "Cannot serialize MSRs. The uVM state needs to save
-                 more MSRs than the target snapshot version supports."
-                    .to_string(),
-            )),
-        }
+        f.debug_struct("VcpuState")
+            .field("cpuid", &self.cpuid)
+            .field("saved_msrs", &debug_kvm_regs)
+            .field("debug_regs", &self.debug_regs)
+            .field("lapic", &self.lapic)
+            .field("mp_state", &self.mp_state)
+            .field("regs", &self.regs)
+            .field("sregs", &self.sregs)
+            .field("vcpu_events", &self.vcpu_events)
+            .field("xcrs", &self.xcrs)
+            .field("xsave", &self.xsave)
+            .field("tsc_khz", &self.tsc_khz)
+            .finish()
     }
 }
 
@@ -632,9 +715,8 @@ impl VcpuState {
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
-    use std::os::unix::io::AsRawFd;
-
-    use kvm_ioctls::Cap;
+    use kvm_bindings::kvm_msr_entry;
+    use kvm_ioctls::{Cap, Kvm};
 
     use super::*;
     use crate::arch::x86_64::cpu_model::CpuModel;
@@ -650,7 +732,6 @@ mod tests {
         fn default() -> Self {
             VcpuState {
                 cpuid: CpuId::new(1).unwrap(),
-                msrs: Msrs::new(1).unwrap(),
                 saved_msrs: vec![Msrs::new(1).unwrap()],
                 debug_regs: Default::default(),
                 lapic: Default::default(),
@@ -691,7 +772,7 @@ mod tests {
         let cpuid = Cpuid::try_from(vm.supported_cpuid().clone())
             .map_err(GuestConfigError::CpuidFromKvmCpuid)?;
         let msrs = vcpu
-            .get_msrs(&template.get_msr_index_list())
+            .get_msrs(template.msr_index_iter())
             .map_err(GuestConfigError::VcpuIoctl)?;
         let base_cpu_config = CpuConfiguration { cpuid, msrs };
         let cpu_config = CpuConfiguration::apply_template(base_cpu_config, template)?;
@@ -791,7 +872,7 @@ mod tests {
         // Restore the state into the existing vcpu.
         let result1 = vcpu.restore_state(&state);
         assert!(result1.is_ok(), "{}", result1.unwrap_err());
-        unsafe { libc::close(vcpu.fd.as_raw_fd()) };
+        drop(vcpu);
 
         // Restore the state into a new vcpu.
         let (_vm, vcpu, _mem) = setup_vcpu(0x10000);
@@ -820,7 +901,7 @@ mod tests {
             smt: false,
             cpu_config: CpuConfiguration {
                 cpuid: Cpuid::try_from(vm.supported_cpuid().clone()).unwrap(),
-                msrs: HashMap::new(),
+                msrs: BTreeMap::new(),
             },
         };
         vcpu.configure(&vm_mem, GuestAddress(0), &vcpu_config)
@@ -882,26 +963,30 @@ mod tests {
             smt: false,
             cpu_config: CpuConfiguration {
                 cpuid: Cpuid::try_from(vm.supported_cpuid().clone()).unwrap(),
-                msrs: HashMap::new(),
+                msrs: BTreeMap::new(),
             },
         };
         vcpu.configure(&vm_mem, GuestAddress(0), &vcpu_config)
             .unwrap();
-        assert!(vcpu.dump_cpu_config().is_ok());
+        vcpu.dump_cpu_config().unwrap();
     }
 
     #[test]
-    #[allow(clippy::cast_sign_loss, clippy::redundant_clone)] // always positive, no u32::try_from(f64)
+    #[allow(clippy::redundant_clone)]
     fn test_is_tsc_scaling_required() {
         // Test `is_tsc_scaling_required` as if it were on the same
         // CPU model as the one in the snapshot state.
         let (_vm, vcpu, _) = setup_vcpu(0x1000);
-        let orig_state = vcpu.save_state().unwrap();
 
         {
             // The frequency difference is within tolerance.
-            let mut state = orig_state.clone();
-            state.tsc_khz = Some(state.tsc_khz.unwrap() + (TSC_KHZ_TOL / 2.0).round() as u32);
+            let mut state = vcpu.save_state().unwrap();
+            state.tsc_khz = Some(
+                state.tsc_khz.unwrap()
+                    + state.tsc_khz.unwrap() * u32::try_from(TSC_KHZ_TOL_NUMERATOR).unwrap()
+                        / u32::try_from(TSC_KHZ_TOL_DENOMINATOR).unwrap()
+                        / 2,
+            );
             assert!(!vcpu
                 .is_tsc_scaling_required(state.tsc_khz.unwrap())
                 .unwrap());
@@ -909,30 +994,45 @@ mod tests {
 
         {
             // The frequency difference is over the tolerance.
-            let mut state = orig_state;
-            state.tsc_khz = Some(state.tsc_khz.unwrap() + (TSC_KHZ_TOL * 2.0).round() as u32);
-            assert!(!vcpu
+            let mut state = vcpu.save_state().unwrap();
+            state.tsc_khz = Some(
+                state.tsc_khz.unwrap()
+                    + state.tsc_khz.unwrap() * u32::try_from(TSC_KHZ_TOL_NUMERATOR).unwrap()
+                        / u32::try_from(TSC_KHZ_TOL_DENOMINATOR).unwrap()
+                        * 2,
+            );
+            assert!(vcpu
                 .is_tsc_scaling_required(state.tsc_khz.unwrap())
                 .unwrap());
+        }
+
+        {
+            // Try a large frequency (30GHz) in the state and check it doesn't
+            // overflow
+            assert!(vcpu.is_tsc_scaling_required(30_000_000).unwrap());
         }
     }
 
     #[test]
-    #[allow(clippy::cast_sign_loss)] // always positive, no u32::try_from(f64)
     fn test_set_tsc() {
         let (vm, vcpu, _) = setup_vcpu(0x1000);
         let mut state = vcpu.save_state().unwrap();
-        state.tsc_khz = Some(state.tsc_khz.unwrap() + (TSC_KHZ_TOL * 2.0).round() as u32);
+        state.tsc_khz = Some(
+            state.tsc_khz.unwrap()
+                + state.tsc_khz.unwrap() * u32::try_from(TSC_KHZ_TOL_NUMERATOR).unwrap()
+                    / u32::try_from(TSC_KHZ_TOL_DENOMINATOR).unwrap()
+                    * 2,
+        );
 
         if vm.fd().check_extension(Cap::TscControl) {
-            assert!(vcpu.set_tsc_khz(state.tsc_khz.unwrap()).is_ok());
+            vcpu.set_tsc_khz(state.tsc_khz.unwrap()).unwrap();
             if vm.fd().check_extension(Cap::GetTscKhz) {
                 assert_eq!(vcpu.get_tsc_khz().ok(), state.tsc_khz);
             } else {
-                assert!(vcpu.get_tsc_khz().is_err());
+                vcpu.get_tsc_khz().unwrap_err();
             }
         } else {
-            assert!(vcpu.set_tsc_khz(state.tsc_khz.unwrap()).is_err());
+            vcpu.set_tsc_khz(state.tsc_khz.unwrap()).unwrap_err();
         }
     }
 
@@ -941,9 +1041,7 @@ mod tests {
         // Test `get_msrs()` with the MSR indices that should be serialized into snapshots.
         // The MSR indices should be valid and this test should succeed.
         let (_, vcpu, _) = setup_vcpu(0x1000);
-        assert!(vcpu
-            .get_msrs(&vcpu.msrs_to_save.iter().copied().collect::<Vec<_>>())
-            .is_ok());
+        vcpu.get_msrs(vcpu.msrs_to_save.iter().copied()).unwrap();
     }
 
     #[test]
@@ -954,23 +1052,145 @@ mod tests {
 
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         let msrs_to_dump = crate::arch::x86_64::msr::get_msrs_to_dump(&kvm).unwrap();
-        assert!(vcpu.get_msrs(msrs_to_dump.as_slice()).is_ok());
+        vcpu.get_msrs(msrs_to_dump.as_slice().iter().copied())
+            .unwrap();
     }
 
     #[test]
     fn test_get_msrs_with_invalid_msr_index() {
-        // Test `get_msrs()` with unsupported MSR indices. This should return
-        // `VcpuGetMsrsIncomplete` error that happens when `KVM_GET_MSRS` fails to populdate
-        // MSR value in the middle and exits. Currently, MSR indices 2..=4 are not listed as
-        // supported MSRs.
+        // Test `get_msrs()` with unsupported MSR indices. This should return `VcpuGetMsr` error
+        // that happens when `KVM_GET_MSRS` fails to populate MSR values in the middle and exits.
+        // Currently, MSR indices 2..=4 are not listed as supported MSRs.
         let (_, vcpu, _) = setup_vcpu(0x1000);
         let msr_index_list: Vec<u32> = vec![2, 3, 4];
-        match vcpu.get_msrs(&msr_index_list) {
-            Err(KvmVcpuError::VcpuGetMsrsIncomplete) => (),
+        match vcpu.get_msrs(msr_index_list.iter().copied()) {
+            Err(KvmVcpuError::VcpuGetMsr(_)) => (),
             Err(err) => panic!("Unexpected error: {err}"),
-            Ok(_) => panic!(
-                "KvmVcpu::get_msrs() for unsupported MSRs should fail with VcpuGetMsrsIncomplete."
-            ),
+            Ok(_) => {
+                panic!("KvmVcpu::get_msrs() for unsupported MSRs should fail with VcpuGetMsr.")
+            }
         }
+    }
+
+    fn msrs_from_entries(msr_entries: &[(u32, u64)]) -> Msrs {
+        Msrs::from_entries(
+            &msr_entries
+                .iter()
+                .map(|&(index, data)| kvm_msr_entry {
+                    index,
+                    data,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn assert_msrs(msr_chunks: &[Msrs], expected_msr_entries: &[(u32, u64)]) {
+        let flattened_msrs = msr_chunks.iter().flat_map(|msrs| msrs.as_slice());
+        for (a, b) in flattened_msrs.zip(expected_msr_entries.iter()) {
+            assert_eq!(a.index, b.0);
+            assert_eq!(a.data, b.1);
+        }
+    }
+
+    #[test]
+    fn test_defer_msrs() {
+        let to_defer = DEFERRED_MSRS[0];
+
+        let mut msr_chunks = [msrs_from_entries(&[(to_defer, 0), (MSR_IA32_TSC, 1)])];
+
+        let deferred = KvmVcpu::extract_deferred_msrs(&mut msr_chunks).unwrap();
+
+        assert_eq!(deferred.as_slice().len(), 1, "did not correctly defer MSR");
+        assert_eq!(
+            msr_chunks[0].as_slice().len(),
+            1,
+            "deferred MSR not removed from chunk"
+        );
+
+        assert_eq!(deferred.as_slice()[0].index, to_defer);
+        assert_eq!(msr_chunks[0].as_slice()[0].index, MSR_IA32_TSC);
+    }
+
+    #[test]
+    fn test_fix_zero_tsc_deadline_msr_zero_same_chunk() {
+        // Place both TSC and TSC_DEADLINE MSRs in the same chunk.
+        let mut msr_chunks = [msrs_from_entries(&[
+            (MSR_IA32_TSC_DEADLINE, 0),
+            (MSR_IA32_TSC, 42),
+        ])];
+
+        KvmVcpu::fix_zero_tsc_deadline_msr(&mut msr_chunks);
+
+        // We expect for the MSR_IA32_TSC_DEADLINE to get updated with the MSR_IA32_TSC value.
+        assert_msrs(
+            &msr_chunks,
+            &[(MSR_IA32_TSC_DEADLINE, 42), (MSR_IA32_TSC, 42)],
+        );
+    }
+
+    #[test]
+    fn test_fix_zero_tsc_deadline_msr_zero_separate_chunks() {
+        // Place both TSC and TSC_DEADLINE MSRs in separate chunks.
+        let mut msr_chunks = [
+            msrs_from_entries(&[(MSR_IA32_TSC_DEADLINE, 0)]),
+            msrs_from_entries(&[(MSR_IA32_TSC, 42)]),
+        ];
+
+        KvmVcpu::fix_zero_tsc_deadline_msr(&mut msr_chunks);
+
+        // We expect for the MSR_IA32_TSC_DEADLINE to get updated with the MSR_IA32_TSC value.
+        assert_msrs(
+            &msr_chunks,
+            &[(MSR_IA32_TSC_DEADLINE, 42), (MSR_IA32_TSC, 42)],
+        );
+    }
+
+    #[test]
+    fn test_fix_zero_tsc_deadline_msr_non_zero() {
+        let mut msr_chunks = [msrs_from_entries(&[
+            (MSR_IA32_TSC_DEADLINE, 1),
+            (MSR_IA32_TSC, 2),
+        ])];
+
+        KvmVcpu::fix_zero_tsc_deadline_msr(&mut msr_chunks);
+
+        // We expect that MSR_IA32_TSC_DEADLINE should remain unchanged, because it is non-zero
+        // already.
+        assert_msrs(
+            &msr_chunks,
+            &[(MSR_IA32_TSC_DEADLINE, 1), (MSR_IA32_TSC, 2)],
+        );
+    }
+
+    #[test]
+    fn test_get_msr_chunks_preserved_order() {
+        // Regression test for #4666
+
+        let kvm = Kvm::new().unwrap();
+        let vm = Vm::new(Vec::new()).unwrap();
+        let vcpu = KvmVcpu::new(0, &vm).unwrap();
+
+        // The list of supported MSR indices, in the order they were returned by KVM
+        let msrs_to_save = crate::arch::x86_64::msr::get_msrs_to_save(&kvm).unwrap();
+        // The MSRs after processing. The order should be identical to the one returned by KVM, with
+        // the exception of deferred MSRs, which should be moved to the end (but show up in the same
+        // order as they are listed in [`DEFERRED_MSRS`].
+        let msr_chunks = vcpu
+            .get_msr_chunks(vcpu.msrs_to_save.iter().copied())
+            .unwrap();
+
+        msr_chunks
+            .iter()
+            .flat_map(|chunk| chunk.as_slice().iter())
+            .zip(
+                msrs_to_save
+                    .as_slice()
+                    .iter()
+                    .filter(|&idx| !DEFERRED_MSRS.contains(idx))
+                    .chain(DEFERRED_MSRS.iter()),
+            )
+            .for_each(|(left, &right)| assert_eq!(left.index, right));
     }
 }

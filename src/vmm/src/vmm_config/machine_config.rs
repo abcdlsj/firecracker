@@ -1,8 +1,8 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-use std::fmt::{self, Debug};
+use std::fmt::Debug;
 
-use serde::{de, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::cpu_config::templates::{CpuTemplateType, CustomCpuTemplate, StaticCpuTemplate};
 
@@ -13,18 +13,82 @@ pub const DEFAULT_MEM_SIZE_MIB: usize = 128;
 pub const MAX_SUPPORTED_VCPUS: u8 = 32;
 
 /// Errors associated with configuring the microVM.
+#[rustfmt::skip]
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
 pub enum VmConfigError {
     /// The memory size (MiB) is smaller than the previously set balloon device target size.
     IncompatibleBalloonSize,
-    /// The memory size (MiB) is invalid.
+    /// The memory size (MiB) is either 0, or not a multiple of the configured page size.
     InvalidMemorySize,
-    #[rustfmt::skip]
-    #[doc = "The vCPU number is invalid! The vCPU number can only be 1 or an even number when SMT is enabled."]
+    /// The number of vCPUs must be greater than 0, less than {MAX_SUPPORTED_VCPUS:} and must be 1 or an even number if SMT is enabled.
     InvalidVcpuCount,
-    #[rustfmt::skip]
-    #[doc = "Could not get the configuration of the previously installed balloon device to validate the memory size."]
+    /// Could not get the configuration of the previously installed balloon device to validate the memory size.
     InvalidVmState,
+    /// Enabling simultaneous multithreading is not supported on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    SmtNotSupported,
+    /// Could not determine host kernel version when checking hugetlbfs compatibility
+    KernelVersion,
+    /// Firecracker's huge pages support is incompatible with memory ballooning.
+    BalloonAndHugePages,
+    /// Firecracker's huge pages support is incompatible with initrds.
+    InitrdAndHugePages,
+}
+
+/// Describes the possible (huge)page configurations for a microVM's memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HugePageConfig {
+    /// Do not use hugepages, e.g. back guest memory by 4K
+    #[default]
+    None,
+    /// Back guest memory by 2MB hugetlbfs pages
+    #[serde(rename = "2M")]
+    Hugetlbfs2M,
+}
+
+impl HugePageConfig {
+    /// Checks whether the given memory size (in MiB) is valid for this [`HugePageConfig`], e.g.
+    /// whether it is a multiple of the page size
+    fn is_valid_mem_size(&self, mem_size_mib: usize) -> bool {
+        let divisor = match self {
+            // Any integer memory size expressed in MiB will be a multiple of 4096KiB.
+            HugePageConfig::None => 1,
+            HugePageConfig::Hugetlbfs2M => 2,
+        };
+
+        mem_size_mib % divisor == 0
+    }
+
+    /// Returns the flags required to pass to `mmap`, in addition to `MAP_ANONYMOUS`, to
+    /// create a mapping backed by huge pages as described by this [`HugePageConfig`].
+    pub fn mmap_flags(&self) -> libc::c_int {
+        match self {
+            HugePageConfig::None => 0,
+            HugePageConfig::Hugetlbfs2M => libc::MAP_HUGETLB | libc::MAP_HUGE_2MB,
+        }
+    }
+
+    /// Returns `true` iff this [`HugePageConfig`] describes a hugetlbfs-based configuration.
+    pub fn is_hugetlbfs(&self) -> bool {
+        matches!(self, HugePageConfig::Hugetlbfs2M)
+    }
+
+    /// Gets the page size in KiB of this [`HugePageConfig`].
+    pub fn page_size_kib(&self) -> usize {
+        match self {
+            HugePageConfig::None => 4096,
+            HugePageConfig::Hugetlbfs2M => 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl From<HugePageConfig> for Option<memfd::HugetlbSize> {
+    fn from(value: HugePageConfig) -> Self {
+        match value {
+            HugePageConfig::None => None,
+            HugePageConfig::Hugetlbfs2M => Some(memfd::HugetlbSize::Huge2MB),
+        }
+    }
 }
 
 /// Struct used in PUT `/machine-config` API call.
@@ -32,35 +96,30 @@ pub enum VmConfigError {
 #[serde(deny_unknown_fields)]
 pub struct MachineConfig {
     /// Number of vcpu to start.
-    #[serde(deserialize_with = "deserialize_vcpu_num")]
     pub vcpu_count: u8,
     /// The memory size in MiB.
     pub mem_size_mib: usize,
     /// Enables or disabled SMT.
-    #[serde(default, deserialize_with = "deserialize_smt")]
+    #[serde(default)]
     pub smt: bool,
     /// A CPU template that it is used to filter the CPU features exposed to the guest.
-    #[serde(default, skip_serializing_if = "StaticCpuTemplate::is_none")]
-    pub cpu_template: StaticCpuTemplate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_template: Option<StaticCpuTemplate>,
     /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
     #[serde(default)]
     pub track_dirty_pages: bool,
+    /// Configures what page size Firecracker should use to back guest memory.
+    #[serde(default)]
+    pub huge_pages: HugePageConfig,
+    /// GDB socket address.
+    #[cfg(feature = "gdb")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdb_socket_path: Option<String>,
 }
 
 impl Default for MachineConfig {
     fn default() -> Self {
         Self::from(&VmConfig::default())
-    }
-}
-
-impl fmt::Display for MachineConfig {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "{{ \"vcpu_count\": {:?}, \"mem_size_mib\": {:?}, \"smt\": {:?}, \"cpu_template\": \
-             {:?}, \"track_dirty_pages\": {:?} }}",
-            self.vcpu_count, self.mem_size_mib, self.smt, self.cpu_template, self.track_dirty_pages
-        )
     }
 }
 
@@ -70,25 +129,17 @@ impl fmt::Display for MachineConfig {
 /// All fields are optional, but at least one needs to be specified.
 /// If a field is `Some(value)` then we assume an update is requested
 /// for that field.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineConfigUpdate {
     /// Number of vcpu to start.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_vcpu_num"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu_count: Option<u8>,
     /// The memory size in MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_size_mib: Option<usize>,
     /// Enables or disabled SMT.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_smt"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smt: Option<bool>,
     /// A CPU template that it is used to filter the CPU features exposed to the guest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +147,13 @@ pub struct MachineConfigUpdate {
     /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_dirty_pages: Option<bool>,
+    /// Configures what page size Firecracker should use to back guest memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub huge_pages: Option<HugePageConfig>,
+    /// GDB socket address.
+    #[cfg(feature = "gdb")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdb_socket_path: Option<String>,
 }
 
 impl MachineConfigUpdate {
@@ -103,16 +161,7 @@ impl MachineConfigUpdate {
     /// Returns `true` if all fields are set to `None` which means that there is nothing
     /// to be updated.
     pub fn is_empty(&self) -> bool {
-        if self.vcpu_count.is_none()
-            && self.mem_size_mib.is_none()
-            && self.cpu_template.is_none()
-            && self.smt.is_none()
-            && self.track_dirty_pages.is_none()
-        {
-            return true;
-        }
-
-        false
+        self == &Default::default()
     }
 }
 
@@ -122,8 +171,11 @@ impl From<MachineConfig> for MachineConfigUpdate {
             vcpu_count: Some(cfg.vcpu_count),
             mem_size_mib: Some(cfg.mem_size_mib),
             smt: Some(cfg.smt),
-            cpu_template: Some(cfg.cpu_template),
+            cpu_template: cfg.cpu_template,
             track_dirty_pages: Some(cfg.track_dirty_pages),
+            huge_pages: Some(cfg.huge_pages),
+            #[cfg(feature = "gdb")]
+            gdb_socket_path: cfg.gdb_socket_path,
         }
     }
 }
@@ -141,6 +193,11 @@ pub struct VmConfig {
     pub cpu_template: Option<CpuTemplateType>,
     /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
     pub track_dirty_pages: bool,
+    /// Configures what page size Firecracker should use to back guest memory.
+    pub huge_pages: HugePageConfig,
+    /// GDB socket address.
+    #[cfg(feature = "gdb")]
+    pub gdb_socket_path: Option<String>,
 }
 
 impl VmConfig {
@@ -149,16 +206,22 @@ impl VmConfig {
         self.cpu_template = Some(CpuTemplateType::Custom(cpu_template));
     }
 
-    /// Updates `VmConfig` with `MachineConfigUpdate`.
-    /// Mapping for cpu tempalte update:
+    /// Updates [`VmConfig`] with [`MachineConfigUpdate`].
+    /// Mapping for cpu template update:
     /// StaticCpuTemplate::None -> None
-    /// StaticCpuTemplate::Other -> Some(CustomCpuTemplate::Static(Other))
-    pub fn update(&mut self, update: &MachineConfigUpdate) -> Result<(), VmConfigError> {
+    /// StaticCpuTemplate::Other -> Some(CustomCpuTemplate::Static(Other)),
+    /// Returns the updated `VmConfig` object.
+    pub fn update(&self, update: &MachineConfigUpdate) -> Result<VmConfig, VmConfigError> {
         let vcpu_count = update.vcpu_count.unwrap_or(self.vcpu_count);
 
         let smt = update.smt.unwrap_or(self.smt);
 
-        if vcpu_count == 0 {
+        #[cfg(target_arch = "aarch64")]
+        if smt {
+            return Err(VmConfigError::SmtNotSupported);
+        }
+
+        if vcpu_count == 0 || vcpu_count > MAX_SUPPORTED_VCPUS {
             return Err(VmConfigError::InvalidVcpuCount);
         }
 
@@ -168,29 +231,29 @@ impl VmConfig {
             return Err(VmConfigError::InvalidVcpuCount);
         }
 
-        self.vcpu_count = vcpu_count;
-        self.smt = smt;
-
         let mem_size_mib = update.mem_size_mib.unwrap_or(self.mem_size_mib);
+        let page_config = update.huge_pages.unwrap_or(self.huge_pages);
 
-        if mem_size_mib == 0 {
+        if mem_size_mib == 0 || !page_config.is_valid_mem_size(mem_size_mib) {
             return Err(VmConfigError::InvalidMemorySize);
         }
 
-        self.mem_size_mib = mem_size_mib;
+        let cpu_template = match update.cpu_template {
+            None => self.cpu_template.clone(),
+            Some(StaticCpuTemplate::None) => None,
+            Some(other) => Some(CpuTemplateType::Static(other)),
+        };
 
-        if let Some(cpu_template) = update.cpu_template {
-            self.cpu_template = match cpu_template {
-                StaticCpuTemplate::None => None,
-                other => Some(CpuTemplateType::Static(other)),
-            };
-        }
-
-        if let Some(track_dirty_pages) = update.track_dirty_pages {
-            self.track_dirty_pages = track_dirty_pages;
-        }
-
-        Ok(())
+        Ok(VmConfig {
+            vcpu_count,
+            mem_size_mib,
+            smt,
+            cpu_template,
+            track_dirty_pages: update.track_dirty_pages.unwrap_or(self.track_dirty_pages),
+            huge_pages: page_config,
+            #[cfg(feature = "gdb")]
+            gdb_socket_path: update.gdb_socket_path.clone(),
+        })
     }
 }
 
@@ -202,6 +265,9 @@ impl Default for VmConfig {
             smt: false,
             cpu_template: None,
             track_dirty_pages: false,
+            huge_pages: HugePageConfig::None,
+            #[cfg(feature = "gdb")]
+            gdb_socket_path: None,
         }
     }
 }
@@ -212,58 +278,11 @@ impl From<&VmConfig> for MachineConfig {
             vcpu_count: value.vcpu_count,
             mem_size_mib: value.mem_size_mib,
             smt: value.smt,
-            cpu_template: (&value.cpu_template).into(),
+            cpu_template: value.cpu_template.as_ref().map(|template| template.into()),
             track_dirty_pages: value.track_dirty_pages,
+            huge_pages: value.huge_pages,
+            #[cfg(feature = "gdb")]
+            gdb_socket_path: value.gdb_socket_path.clone(),
         }
     }
-}
-
-/// Deserialization function for the `vcpu_num` field in `MachineConfig` and `MachineConfigUpdate`.
-/// This is called only when `vcpu_num` is present in the JSON configuration.
-/// `T` can be either `u8` or `Option<u8>` which both support ordering if `vcpu_num` is
-/// present in the JSON.
-fn deserialize_vcpu_num<'de, D, T>(d: D) -> Result<T, D::Error>
-where
-    D: de::Deserializer<'de>,
-    T: Deserialize<'de> + PartialOrd + From<u8> + Debug,
-{
-    let val = T::deserialize(d)?;
-
-    if val > T::from(MAX_SUPPORTED_VCPUS) {
-        return Err(de::Error::invalid_value(
-            de::Unexpected::Other("vcpu_num"),
-            &"number of vCPUs exceeds the maximum limitation",
-        ));
-    }
-    if val < T::from(1) {
-        return Err(de::Error::invalid_value(
-            de::Unexpected::Other("vcpu_num"),
-            &"number of vCPUs should be larger than 0",
-        ));
-    }
-
-    Ok(val)
-}
-
-/// Deserialization function for the `smt` field in `MachineConfig` and `MachineConfigUpdate`.
-/// This is called only when `smt` is present in the JSON configuration.
-fn deserialize_smt<'de, D, T>(d: D) -> Result<T, D::Error>
-where
-    D: de::Deserializer<'de>,
-    T: Deserialize<'de> + PartialEq + From<bool> + Debug,
-{
-    let val = T::deserialize(d)?;
-
-    // If this function was called it means that `smt` was specified in
-    // the JSON. On aarch64 the only accepted value is `false` so throw an
-    // error if `true` was specified.
-    #[cfg(target_arch = "aarch64")]
-    if val == T::from(true) {
-        return Err(de::Error::invalid_value(
-            de::Unexpected::Other("smt"),
-            &"Enabling simultaneous multithreading is not supported on aarch64",
-        ));
-    }
-
-    Ok(val)
 }

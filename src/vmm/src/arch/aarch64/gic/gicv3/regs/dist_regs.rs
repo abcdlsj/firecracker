@@ -32,8 +32,7 @@ const GICD_IROUTER: DistReg = DistReg::shared_irq(0x6000, 64);
 // Criteria for the present list of registers: only R/W registers, implementation specific registers
 // are not saved. GICD_CPENDSGIR and GICD_SPENDSGIR are not saved since these registers are not used
 // when affinity routing is enabled. Affinity routing GICv3 is enabled by default unless Firecracker
-// clears the ICD_CTLR.ARE bit which it does not do. NOTICE: Any changes to this structure require a
-// snapshot version bump.
+// clears the ICD_CTLR.ARE bit which it does not do.
 static VGIC_DIST_REGS: &[DistReg] = &[
     GICD_CTLR,
     GICD_STATUSR,
@@ -145,23 +144,24 @@ mod tests {
         let gic_fd = create_gic(&vm, 1, Some(GICVersion::GICV3)).expect("Cannot create gic");
 
         let res = get_dist_regs(gic_fd.device_fd());
-        assert!(res.is_ok());
         let state = res.unwrap();
         assert_eq!(state.len(), 12);
         // Check GICD_CTLR size.
         assert_eq!(state[0].chunks.len(), 1);
 
         let res = set_dist_regs(gic_fd.device_fd(), &state);
-        assert!(res.is_ok());
+        res.unwrap();
 
         unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
 
         let res = get_dist_regs(gic_fd.device_fd());
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 1)"
         );
+
+        // dropping gic_fd would double close the gic fd, so leak it
+        std::mem::forget(gic_fd);
     }
 
     #[test]

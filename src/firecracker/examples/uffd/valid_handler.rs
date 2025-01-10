@@ -7,39 +7,26 @@
 
 mod uffd_utils;
 
-use std::os::unix::io::AsRawFd;
+use std::fs::File;
+use std::os::unix::net::UnixListener;
 
-use uffd_utils::{create_pf_handler, MemPageState};
+use uffd_utils::{MemPageState, Runtime, UffdHandler};
 
 fn main() {
-    let mut uffd_handler = create_pf_handler();
+    let mut args = std::env::args();
+    let uffd_sock_path = args.nth(1).expect("No socket path given");
+    let mem_file_path = args.next().expect("No memory file given");
 
-    let mut pollfd = libc::pollfd {
-        fd: uffd_handler.uffd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // Loop, handling incoming events on the userfaultfd file descriptor.
-    loop {
-        // See what poll() tells us about the userfaultfd.
-        let nready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+    let file = File::open(mem_file_path).expect("Cannot open memfile");
 
-        if nready == -1 {
-            panic!("Could not poll for events!")
-        }
+    // Get Uffd from UDS. We'll use the uffd to handle PFs for Firecracker.
+    let listener = UnixListener::bind(uffd_sock_path).expect("Cannot bind to socket path");
+    let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 
-        let revents = pollfd.revents;
-
-        println!(
-            "poll() returns: nready = {}; POLLIN = {}; POLLERR = {}",
-            nready,
-            revents & libc::POLLIN,
-            revents & libc::POLLERR,
-        );
-
+    let mut runtime = Runtime::new(stream, file);
+    runtime.run(|uffd_handler: &mut UffdHandler| {
         // Read an event from the userfaultfd.
         let event = uffd_handler
-            .uffd
             .read_event()
             .expect("Failed to read uffd_msg")
             .expect("uffd_msg not ready");
@@ -47,13 +34,15 @@ fn main() {
         // We expect to receive either a Page Fault or Removed
         // event (if the balloon device is enabled).
         match event {
-            userfaultfd::Event::Pagefault { addr, .. } => uffd_handler.serve_pf(addr as *mut u8),
+            userfaultfd::Event::Pagefault { addr, .. } => {
+                uffd_handler.serve_pf(addr.cast(), uffd_handler.page_size)
+            }
             userfaultfd::Event::Remove { start, end } => uffd_handler.update_mem_state_mappings(
-                start as *mut u8 as u64,
-                end as *mut u8 as u64,
-                &MemPageState::Removed,
+                start as u64,
+                end as u64,
+                MemPageState::Removed,
             ),
             _ => panic!("Unexpected event on userfaultfd"),
         }
-    }
+    });
 }

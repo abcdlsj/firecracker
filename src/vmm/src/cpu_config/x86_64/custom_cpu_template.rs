@@ -16,6 +16,7 @@ use crate::cpu_config::templates_serde::*;
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 use crate::cpu_config::x86_64::cpuid::{KvmCpuidFlags, VENDOR_ID_AMD, VENDOR_ID_INTEL};
 use crate::cpu_config::x86_64::static_cpu_templates::{c3, t2, t2a, t2cl, t2s, StaticCpuTemplate};
+use crate::logger::warn;
 
 impl GetCpuTemplate for Option<CpuTemplateType> {
     fn get_cpu_template(&self) -> Result<Cow<CustomCpuTemplate>, GetCpuTemplateError> {
@@ -32,7 +33,7 @@ impl GetCpuTemplate for Option<CpuTemplateType> {
                                 return Err(CpuVendorMismatched);
                             }
                             if !CpuModel::get_cpu_model().is_at_least_cascade_lake() {
-                                log::warn!(
+                                warn!(
                                     "On processors that do not enumerate FBSDP_NO, PSDP_NO and \
                                      SBDR_SSDP_NO on IA32_ARCH_CAPABILITIES MSR, the guest kernel \
                                      does not apply the mitigation against MMIO stale data \
@@ -143,12 +144,9 @@ pub struct CustomCpuTemplate {
 }
 
 impl CustomCpuTemplate {
-    /// Get a list of MSR indices that are modified by the CPU template.
-    pub fn get_msr_index_list(&self) -> Vec<u32> {
-        self.msr_modifiers
-            .iter()
-            .map(|modifier| modifier.addr)
-            .collect()
+    /// Get an iterator of MSR indices that are modified by the CPU template.
+    pub fn msr_index_iter(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.msr_modifiers.iter().map(|modifier| modifier.addr)
     }
 
     /// Validate the correctness of the template.
@@ -388,7 +386,6 @@ mod tests {
                     ],
                 }"#,
         );
-        assert!(cpu_template_result.is_err());
         assert!(cpu_template_result
             .unwrap_err()
             .to_string()
@@ -405,7 +402,6 @@ mod tests {
                     ]
                 }"#,
         );
-        assert!(cpu_template_result.is_err());
         let error_msg: String = cpu_template_result.unwrap_err().to_string();
         // Formatted error expected clarifying the number system prefix is missing
         assert!(
@@ -432,7 +428,6 @@ mod tests {
                     ],
                 }"#,
         );
-        assert!(cpu_template_result.is_err());
         let error_msg: String = cpu_template_result.unwrap_err().to_string();
         // Formatted error expected clarifying the number system prefix is missing
         assert!(
@@ -451,7 +446,6 @@ mod tests {
                     ]
                 }"#,
         );
-        assert!(cpu_template_result.is_err());
         assert!(cpu_template_result.unwrap_err().to_string().contains(
             "Failed to parse string [0bx0?1_0_0x_?x1xxxx00xxx1xxxxxxxxxxx1] as a bitmap"
         ));
@@ -466,7 +460,6 @@ mod tests {
                     ]
                 }"#,
         );
-        assert!(cpu_template_result.is_err());
         assert!(cpu_template_result
             .unwrap_err()
             .to_string()
@@ -485,11 +478,9 @@ mod tests {
     fn test_serialization_lifecycle() {
         let template = build_test_template();
         let template_json_str_result = serde_json::to_string_pretty(&template);
-        assert!(&template_json_str_result.is_ok());
         let template_json = template_json_str_result.unwrap();
 
         let deserialization_result = serde_json::from_str::<CustomCpuTemplate>(&template_json);
-        assert!(deserialization_result.is_ok());
         assert_eq!(template, deserialization_result.unwrap());
     }
 

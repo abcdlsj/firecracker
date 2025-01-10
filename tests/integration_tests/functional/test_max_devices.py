@@ -6,19 +6,19 @@ import platform
 
 import pytest
 
-# IRQs are available from 5 to 23, so the maximum number of devices
-# supported at the same time is 19.
-MAX_DEVICES_ATTACHED = 19
+# IRQs are available from 5 to 23. We always use one IRQ for VMGenID device, so
+# the maximum number of devices supported at the same time is 18.
+MAX_DEVICES_ATTACHED = 18
 
 
 @pytest.mark.skipif(
     platform.machine() != "x86_64", reason="Firecracker supports 24 IRQs on x86_64."
 )
-def test_attach_maximum_devices(test_microvm_with_api):
+def test_attach_maximum_devices(uvm_plain_any):
     """
     Test attaching maximum number of devices to the microVM.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain_any
     test_microvm.spawn()
 
     # Set up a basic microVM.
@@ -33,18 +33,17 @@ def test_attach_maximum_devices(test_microvm_with_api):
     # Test that network devices attached are operational.
     for i in range(MAX_DEVICES_ATTACHED - 1):
         # Verify if guest can run commands.
-        exit_code, _, _ = test_microvm.ssh_iface(i).run("sync")
-        assert exit_code == 0
+        test_microvm.ssh_iface(i).check_output("sync")
 
 
 @pytest.mark.skipif(
     platform.machine() != "x86_64", reason="Firecracker supports 24 IRQs on x86_64."
 )
-def test_attach_too_many_devices(test_microvm_with_api):
+def test_attach_too_many_devices(uvm_plain):
     """
     Test attaching to a microVM more devices than available IRQs.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     # Set up a basic microVM.

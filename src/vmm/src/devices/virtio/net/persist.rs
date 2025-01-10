@@ -4,67 +4,56 @@
 //! Defines the structures needed for saving/restoring net devices.
 
 use std::io;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
-use log::warn;
-use snapshot::Persist;
-use utils::net::mac::{MacAddr, MAC_ADDR_LEN};
-use utils::vm_memory::GuestMemoryMmap;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
+use serde::{Deserialize, Serialize};
 
-use super::device::Net;
-use super::NET_NUM_QUEUES;
+use super::device::{Net, RxBuffers};
+use super::{TapError, NET_NUM_QUEUES, NET_QUEUE_MAX_SIZE, RX_INDEX};
+use crate::devices::virtio::device::DeviceState;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
-use crate::devices::virtio::{DeviceState, FIRECRACKER_MAX_QUEUE_SIZE, TYPE_NET};
+use crate::devices::virtio::TYPE_NET;
 use crate::mmds::data_store::Mmds;
 use crate::mmds::ns::MmdsNetworkStack;
 use crate::mmds::persist::MmdsNetworkStackState;
 use crate::rate_limiter::persist::RateLimiterState;
 use crate::rate_limiter::RateLimiter;
+use crate::snapshot::Persist;
+use crate::utils::net::mac::MacAddr;
+use crate::vstate::memory::GuestMemoryMmap;
 
 /// Information about the network config's that are saved
 /// at snapshot.
-#[derive(Debug, Default, Clone, Versionize)]
-// NOTICE: Any changes to this structure require a snapshot version bump.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetConfigSpaceState {
-    #[version(end = 2, default_fn = "def_guest_mac_old")]
-    guest_mac: [u8; MAC_ADDR_LEN],
-    #[version(start = 2, de_fn = "de_guest_mac_v2", ser_fn = "ser_guest_mac_v2")]
-    guest_mac_v2: Option<MacAddr>,
+    guest_mac: Option<MacAddr>,
 }
 
-impl NetConfigSpaceState {
-    fn de_guest_mac_v2(&mut self, version: u16) -> VersionizeResult<()> {
-        // v1.1 and older versions do not have optional MAC address.
-        warn!("Optional MAC address will be set to older version.");
-        if version < 2 {
-            self.guest_mac_v2 = Some(self.guest_mac.into());
-        }
-        Ok(())
-    }
+/// Information about the parsed RX buffers
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RxBufferState {
+    // Number of iovecs we have parsed from the guest
+    parsed_descriptor_chains_nr: u16,
+    // Number of used descriptors
+    used_descriptors: u16,
+    // Number of used bytes
+    used_bytes: u32,
+}
 
-    fn ser_guest_mac_v2(&mut self, _target_version: u16) -> VersionizeResult<()> {
-        // v1.1 and older versions do not have optional MAC address.
-        warn!("Saving to older snapshot version, optional MAC address will not be saved.");
-        match self.guest_mac_v2 {
-            Some(mac) => self.guest_mac = mac.into(),
-            None => self.guest_mac = Default::default(),
+impl RxBufferState {
+    fn from_rx_buffers(rx_buffer: &RxBuffers) -> Self {
+        RxBufferState {
+            parsed_descriptor_chains_nr: rx_buffer.parsed_descriptors.len().try_into().unwrap(),
+            used_descriptors: rx_buffer.used_descriptors,
+            used_bytes: rx_buffer.used_bytes,
         }
-        Ok(())
-    }
-
-    fn def_guest_mac_old(_: u16) -> [u8; MAC_ADDR_LEN] {
-        // v1.2 and newer don't use this field anyway
-        Default::default()
     }
 }
 
 /// Information about the network device that are saved
 /// at snapshot.
-#[derive(Debug, Clone, Versionize)]
-// NOTICE: Any changes to this structure require a snapshot version bump.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetState {
     id: String,
     tap_if_name: String,
@@ -74,6 +63,7 @@ pub struct NetState {
     pub mmds_ns: Option<MmdsNetworkStackState>,
     config_space: NetConfigSpaceState,
     virtio_state: VirtioDeviceState,
+    rx_buffers_state: RxBufferState,
 }
 
 /// Auxiliary structure for creating a device when resuming from a snapshot.
@@ -86,16 +76,18 @@ pub struct NetConstructorArgs {
 }
 
 /// Errors triggered when trying to construct a network device at resume time.
-#[derive(Debug, derive_more::From)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum NetPersistError {
-    /// Failed to create a network device.
-    CreateNet(super::NetError),
-    /// Failed to create a rate limiter.
-    CreateRateLimiter(io::Error),
-    /// Failed to re-create the virtio state (i.e queues etc).
-    VirtioState(VirtioStateError),
+    /// Failed to create a network device: {0}
+    CreateNet(#[from] super::NetError),
+    /// Failed to create a rate limiter: {0}
+    CreateRateLimiter(#[from] io::Error),
+    /// Failed to re-create the virtio state (i.e queues etc): {0}
+    VirtioState(#[from] VirtioStateError),
     /// Indicator that no MMDS is associated with this device.
     NoMmdsDataStore,
+    /// Setting tap interface offload flags failed: {0}
+    TapSetOffload(TapError),
 }
 
 impl Persist<'_> for Net {
@@ -111,10 +103,10 @@ impl Persist<'_> for Net {
             tx_rate_limiter_state: self.tx_rate_limiter.save(),
             mmds_ns: self.mmds_ns.as_ref().map(|mmds| mmds.save()),
             config_space: NetConfigSpaceState {
-                guest_mac_v2: self.guest_mac,
-                guest_mac: Default::default(),
+                guest_mac: self.guest_mac,
             },
             virtio_state: VirtioDeviceState::from_device(self),
+            rx_buffers_state: RxBufferState::from_rx_buffers(&self.rx_buffer),
         }
     }
 
@@ -128,7 +120,7 @@ impl Persist<'_> for Net {
         let mut net = Net::new(
             state.id.clone(),
             &state.tap_if_name,
-            state.config_space.guest_mac_v2,
+            state.config_space.guest_mac,
             rx_rate_limiter,
             tx_rate_limiter,
         )?;
@@ -154,15 +146,26 @@ impl Persist<'_> for Net {
             &constructor_args.mem,
             TYPE_NET,
             NET_NUM_QUEUES,
-            FIRECRACKER_MAX_QUEUE_SIZE,
+            NET_QUEUE_MAX_SIZE,
         )?;
-        net.irq_trigger.irq_status =
-            Arc::new(AtomicUsize::new(state.virtio_state.interrupt_status));
+        net.irq_trigger.irq_status = Arc::new(AtomicU32::new(state.virtio_state.interrupt_status));
         net.avail_features = state.virtio_state.avail_features;
         net.acked_features = state.virtio_state.acked_features;
 
         if state.virtio_state.activated {
+            let supported_flags: u32 = Net::build_tap_offload_features(net.acked_features);
+            net.tap
+                .set_offload(supported_flags)
+                .map_err(NetPersistError::TapSetOffload)?;
+
             net.device_state = DeviceState::Activated(constructor_args.mem);
+
+            // Recreate `Net::rx_buffer`. We do it by re-parsing the RX queue. We're temporarily
+            // rolling back `next_avail` in the RX queue and call `parse_rx_descriptors`.
+            net.queues[RX_INDEX].next_avail -= state.rx_buffers_state.parsed_descriptor_chains_nr;
+            net.parse_rx_descriptors();
+            net.rx_buffer.used_descriptors = state.rx_buffers_state.used_descriptors;
+            net.rx_buffer.used_bytes = state.rx_buffers_state.used_bytes;
         }
 
         Ok(net)
@@ -177,11 +180,11 @@ mod tests {
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::net::test_utils::{default_net, default_net_no_mmds};
     use crate::devices::virtio::test_utils::default_mem;
+    use crate::snapshot::Snapshot;
 
     fn validate_save_and_restore(net: Net, mmds_ds: Option<Arc<Mutex<Mmds>>>) {
         let guest_mem = default_mem();
         let mut mem = vec![0; 4096];
-        let version_map = VersionMap::new();
 
         let id;
         let tap_if_name;
@@ -191,9 +194,7 @@ mod tests {
 
         // Create and save the net device.
         {
-            <Net as Persist>::save(&net)
-                .serialize(&mut mem.as_mut_slice(), &version_map, 1)
-                .unwrap();
+            Snapshot::serialize(&mut mem.as_mut_slice(), &net.save()).unwrap();
 
             // Save some fields that we want to check later.
             id = net.id.clone();
@@ -213,7 +214,7 @@ mod tests {
                     mem: guest_mem,
                     mmds: mmds_ds,
                 },
-                &NetState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
+                &Snapshot::deserialize(&mut mem.as_slice()).unwrap(),
             ) {
                 Ok(restored_net) => {
                     // Test that virtio specific fields are the same.

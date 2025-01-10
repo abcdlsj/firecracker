@@ -286,25 +286,18 @@ impl CpuidTrait for kvm_bindings::CpuId {
     }
 }
 
-/// Error type for [`apply_brand_string`].
+/// Error type for [`CpuidTrait::apply_brand_string`].
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 #[error("Missing brand string leaves 0x80000002, 0x80000003 and 0x80000004.")]
 pub struct MissingBrandStringLeaves;
 
-/// Error type for [`Cpuid::kvm_get_supported_cpuid`].
-#[derive(Debug, thiserror::Error, displaydoc::Display, Eq, PartialEq)]
-pub enum KvmGetSupportedCpuidError {
-    /// Could not access KVM: {0}
-    KvmAccess(#[from] utils::errno::Error),
-}
-
 /// Error type for conversion from `kvm_bindings::CpuId` to `Cpuid`.
+#[rustfmt::skip]
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
 pub enum CpuidTryFromKvmCpuid {
     /// Leaf 0 not found in the given `kvm_bindings::CpuId`.
     MissingLeaf0,
-    #[rustfmt::skip]
-    #[doc = "Unsupported CPUID manufacturer id: \"{0:?}\" (only 'GenuineIntel' and 'AuthenticAMD' are supported)."]
+    /// Unsupported CPUID manufacturer id: \"{0:?}\" (only 'GenuineIntel' and 'AuthenticAMD' are supported).
     UnsupportedVendor([u8; 12]),
 }
 
@@ -417,7 +410,7 @@ impl TryFrom<kvm_bindings::CpuId> for Cpuid {
 }
 
 impl TryFrom<Cpuid> for kvm_bindings::CpuId {
-    type Error = utils::fam::Error;
+    type Error = vmm_sys_util::fam::Error;
 
     fn try_from(cpuid: Cpuid) -> Result<Self, Self::Error> {
         let entries = cpuid
@@ -467,11 +460,7 @@ impl CpuidKey {
 impl std::cmp::PartialOrd for CpuidKey {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(
-            self.leaf
-                .cmp(&other.leaf)
-                .then(self.subleaf.cmp(&other.subleaf)),
-        )
+        Some(std::cmp::Ord::cmp(self, other))
     }
 }
 
@@ -564,8 +553,8 @@ pub struct CpuidEntry {
 }
 
 /// To transmute this into leaves such that we can return mutable reference to it with leaf specific
-/// accessors, requires this to have a consistent member ordering. [`core::arch::x86::CpuidResult`]
-/// is not `repr(C)`.
+/// accessors, requires this to have a consistent member ordering.
+/// [`core::arch::x86_64::CpuidResult`] is not `repr(C)`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(C)]
 pub struct CpuidRegisters {

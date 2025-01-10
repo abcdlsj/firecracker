@@ -9,10 +9,12 @@
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
+use acpi_tables::aml::AmlError;
+use acpi_tables::{aml, Aml};
 use kvm_ioctls::VmFd;
 use libc::EFD_NONBLOCK;
-use utils::eventfd::EventFd;
 use vm_superio::Serial;
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::bus::BusDevice;
 use crate::devices::legacy::serial::SerialOut;
@@ -167,22 +169,87 @@ impl PortIODeviceManager {
 
         Ok(())
     }
+
+    pub(crate) fn append_aml_bytes(bytes: &mut Vec<u8>) -> Result<(), AmlError> {
+        // Set up COM devices
+        let gsi = [
+            Self::COM_EVT_1_3_GSI,
+            Self::COM_EVT_2_4_GSI,
+            Self::COM_EVT_1_3_GSI,
+            Self::COM_EVT_2_4_GSI,
+        ];
+        for com in 0u8..4 {
+            // COM1
+            aml::Device::new(
+                format!("_SB_.COM{}", com + 1).as_str().try_into()?,
+                vec![
+                    &aml::Name::new("_HID".try_into()?, &aml::EisaName::new("PNP0501")?)?,
+                    &aml::Name::new("_UID".try_into()?, &com)?,
+                    &aml::Name::new("_DDN".try_into()?, &format!("COM{}", com + 1))?,
+                    &aml::Name::new(
+                        "_CRS".try_into().unwrap(),
+                        &aml::ResourceTemplate::new(vec![
+                            &aml::Interrupt::new(true, true, false, false, gsi[com as usize]),
+                            &aml::Io::new(
+                                PortIODeviceManager::SERIAL_PORT_ADDRESSES[com as usize]
+                                    .try_into()
+                                    .unwrap(),
+                                PortIODeviceManager::SERIAL_PORT_ADDRESSES[com as usize]
+                                    .try_into()
+                                    .unwrap(),
+                                1,
+                                PortIODeviceManager::SERIAL_PORT_SIZE.try_into().unwrap(),
+                            ),
+                        ]),
+                    )?,
+                ],
+            )
+            .append_aml_bytes(bytes)?;
+        }
+        // Setup i8042
+        aml::Device::new(
+            "_SB_.PS2_".try_into()?,
+            vec![
+                &aml::Name::new("_HID".try_into()?, &aml::EisaName::new("PNP0303")?)?,
+                &aml::Method::new(
+                    "_STA".try_into()?,
+                    0,
+                    false,
+                    vec![&aml::Return::new(&0x0fu8)],
+                ),
+                &aml::Name::new(
+                    "_CRS".try_into()?,
+                    &aml::ResourceTemplate::new(vec![
+                        &aml::Io::new(
+                            PortIODeviceManager::I8042_KDB_DATA_REGISTER_ADDRESS
+                                .try_into()
+                                .unwrap(),
+                            PortIODeviceManager::I8042_KDB_DATA_REGISTER_ADDRESS
+                                .try_into()
+                                .unwrap(),
+                            1u8,
+                            1u8,
+                        ),
+                        // Fake a command port so Linux stops complaining
+                        &aml::Io::new(0x0064, 0x0064, 1u8, 1u8),
+                        &aml::Interrupt::new(true, true, false, false, Self::KBD_EVT_GSI),
+                    ]),
+                )?,
+            ],
+        )
+        .append_aml_bytes(bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use utils::vm_memory::GuestAddress;
-
     use super::*;
+    use crate::test_utils::single_region_mem;
     use crate::Vm;
 
     #[test]
     fn test_register_legacy_devices() {
-        let guest_mem = utils::vm_memory::test_utils::create_anon_guest_memory(
-            &[(GuestAddress(0x0), 0x1000)],
-            false,
-        )
-        .unwrap();
+        let guest_mem = single_region_mem(0x1000);
         let mut vm = Vm::new(vec![]).unwrap();
         vm.memory_init(&guest_mem, false).unwrap();
         crate::builder::setup_interrupt_controller(&mut vm).unwrap();
@@ -200,6 +267,6 @@ mod tests {
             EventFd::new(libc::EFD_NONBLOCK).unwrap(),
         )
         .unwrap();
-        assert!(ldm.register_devices(vm.fd()).is_ok());
+        ldm.register_devices(vm.fd()).unwrap();
     }
 }

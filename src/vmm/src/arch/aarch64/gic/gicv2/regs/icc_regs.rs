@@ -23,7 +23,6 @@ const GICC_APR2: SimpleReg = SimpleReg::new(0x00D4, 4);
 const GICC_APR3: SimpleReg = SimpleReg::new(0x00D8, 4);
 const GICC_APR4: SimpleReg = SimpleReg::new(0x00DC, 4);
 
-// NOTICE: Any changes to this structure require a snapshot version bump.
 static MAIN_VGIC_ICC_REGS: &[SimpleReg] = &[
     GICC_CTLR, GICC_PMR, GICC_BPR, GICC_APBR, GICC_APR1, GICC_APR2, GICC_APR3, GICC_APR4,
 ];
@@ -102,28 +101,27 @@ mod tests {
 
         let cpu_id = 0;
         let res = get_icc_regs(gic_fd.device_fd(), cpu_id);
-        assert!(res.is_ok());
-
         let state = res.unwrap();
         assert_eq!(state.main_icc_regs.len(), 8);
         assert_eq!(state.ap_icc_regs.len(), 0);
 
-        assert!(set_icc_regs(gic_fd.device_fd(), cpu_id, &state).is_ok());
+        set_icc_regs(gic_fd.device_fd(), cpu_id, &state).unwrap();
 
         unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
 
         let res = set_icc_regs(gic_fd.device_fd(), cpu_id, &state);
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), true, 2)"
         );
 
         let res = get_icc_regs(gic_fd.device_fd(), cpu_id);
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 2)"
         );
+
+        // dropping gic_fd would double close the gic fd, so leak it
+        std::mem::forget(gic_fd);
     }
 }

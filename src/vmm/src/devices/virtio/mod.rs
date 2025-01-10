@@ -8,29 +8,25 @@
 //! Implements virtio devices, queues, and transport mechanisms.
 
 use std::any::Any;
-use std::io::Error as IOError;
+
+use self::queue::QueueError;
+use crate::devices::virtio::net::TapError;
 
 pub mod balloon;
 pub mod block;
 pub mod device;
-mod iovec;
-mod mmio;
+pub mod gen;
+mod iov_deque;
+pub mod iovec;
+pub mod mmio;
 pub mod net;
 pub mod persist;
-mod queue;
+pub mod queue;
 pub mod rng;
 pub mod test_utils;
+pub mod vhost_user;
+pub mod vhost_user_metrics;
 pub mod vsock;
-
-pub use self::balloon::*;
-pub use self::block::*;
-pub use self::device::*;
-pub use self::mmio::*;
-pub use self::net::*;
-pub use self::persist::*;
-pub use self::queue::*;
-pub use self::rng::*;
-pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the
 /// completed stages using the Device Status Field.
@@ -47,6 +43,7 @@ mod device_status {
     pub const FAILED: u32 = 128;
     pub const FEATURES_OK: u32 = 8;
     pub const DRIVER_OK: u32 = 4;
+    pub const DEVICE_NEEDS_RESET: u32 = 64;
 }
 
 /// Types taken from linux/virtio_ids.h.
@@ -65,12 +62,18 @@ pub const TYPE_BALLOON: u32 = 5;
 pub const NOTIFY_REG_OFFSET: u32 = 0x50;
 
 /// Errors triggered when activating a VirtioDevice.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ActivateError {
-    /// Epoll error.
-    EpollCtl(IOError),
-    /// General error at activation.
-    BadActivate,
+    /// Wrong number of queue for virtio device: expected {expected}, got {got}
+    QueueMismatch { expected: usize, got: usize },
+    /// Failed to write to activate eventfd
+    EventFd,
+    /// Vhost user: {0}
+    VhostUser(vhost_user::VhostUserError),
+    /// Setting tap interface offload flags failed: {0}
+    TapSetOffload(TapError),
+    /// Error setting pointers in the queue: (0)
+    QueueMemoryError(QueueError),
 }
 
 /// Trait that helps in upcasting an object to Any

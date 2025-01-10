@@ -203,7 +203,7 @@ impl Compiler {
                 .syscall_table
                 .get_syscall_nr(&syscall_name)
                 .ok_or_else(|| CompilationError::SyscallName(syscall_name.clone(), self.arch))?;
-            let rule_accumulator = rule_map.entry(syscall_nr).or_insert_with(Vec::new);
+            let rule_accumulator = rule_map.entry(syscall_nr).or_default();
 
             match syscall_rule.conditions {
                 Some(conditions) => rule_accumulator.push(SeccompRule::new(conditions, action)),
@@ -258,7 +258,7 @@ mod tests {
     };
 
     impl Filter {
-        pub fn new(
+        fn new(
             default_action: SeccompAction,
             filter_action: SeccompAction,
             filter: Vec<SyscallRule>,
@@ -272,7 +272,7 @@ mod tests {
     }
 
     impl SyscallRule {
-        pub fn new(syscall: String, conditions: Option<Vec<Cond>>) -> SyscallRule {
+        fn new(syscall: String, conditions: Option<Vec<Cond>>) -> SyscallRule {
             SyscallRule {
                 syscall,
                 conditions,
@@ -506,11 +506,11 @@ mod tests {
         // We don't test the BPF compilation in this module.
         // This is done in the seccomp/lib.rs module.
         // Here, we only test the (Filter -> SeccompFilter) transformations. (High-level -> IR)
-        assert!(compiler
+        compiler
             .compile_blob(correct_filters.clone(), false)
-            .is_ok());
+            .unwrap();
         // Also test with basic filtering on.
-        assert!(compiler.compile_blob(correct_filters, true).is_ok());
+        compiler.compile_blob(correct_filters, true).unwrap();
     }
 
     #[test]

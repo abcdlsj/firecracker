@@ -41,6 +41,8 @@ pub fn restore_state(fd: &DeviceFd, mpidrs: &[u64], state: &GicState) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::undocumented_unsafe_blocks)]
+
     use kvm_ioctls::Kvm;
 
     use super::*;
@@ -59,7 +61,6 @@ mod tests {
         let mpidr = vec![0];
         let res = save_state(gic_fd.device_fd(), &mpidr);
         // We will receive an error if trying to call before creating vcpu.
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(22), false, 2)"
@@ -80,7 +81,9 @@ mod tests {
             addr: &val as *const u32 as u64,
             flags: 0,
         };
-        gic_fd.get_device_attr(&mut gic_dist_attr).unwrap();
+        unsafe {
+            gic_fd.get_device_attr(&mut gic_dist_attr).unwrap();
+        }
 
         // The second value from the list of distributor registers is the value of the GICD_STATUSR
         // register. We assert that the one saved in the bitmap is the same with the one we
@@ -89,6 +92,6 @@ mod tests {
 
         assert_eq!(gicd_statusr.chunks[0], val);
         assert_eq!(vm_state.dist.len(), 7);
-        assert!(restore_state(gic_fd, &mpidr, &vm_state).is_ok());
+        restore_state(gic_fd, &mpidr, &vm_state).unwrap();
     }
 }

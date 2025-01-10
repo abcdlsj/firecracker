@@ -31,7 +31,7 @@ pub struct MuxerRxQ {
 }
 
 impl MuxerRxQ {
-    const SIZE: usize = defs::MUXER_RXQ_SIZE;
+    const SIZE: usize = defs::MUXER_RXQ_SIZE as usize;
 
     /// Trivial RX queue constructor.
     pub fn new() -> Self {
@@ -67,6 +67,7 @@ impl MuxerRxQ {
     /// A push will fail when:
     /// - trying to push a connection key onto an out-of-sync, or full queue; or
     /// - trying to push an RST onto a queue already full of RSTs.
+    ///
     /// RSTs take precedence over connections, because connections can always be queried for
     /// pending RX data later. Aside from this queue, there is no other storage for RSTs, so
     /// failing to push one means that we have to drop the packet.

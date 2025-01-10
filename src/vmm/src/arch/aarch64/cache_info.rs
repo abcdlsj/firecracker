@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use log::warn;
+use crate::logger::warn;
 
 // Based on https://elixir.free-electrons.com/linux/v4.9.62/source/arch/arm64/kernel/cacheinfo.c#L29.
 const MAX_CACHE_LEVEL: u8 = 7;
@@ -37,14 +37,15 @@ pub(crate) struct CacheEntry {
     pub level: u8,
     // Type of cache: Unified, Data, Instruction.
     pub type_: CacheType,
-    pub size_: Option<usize>,
-    pub number_of_sets: Option<u16>,
+    pub size_: Option<u32>,
+    pub number_of_sets: Option<u32>,
     pub line_size: Option<u16>,
     // How many CPUS share this cache.
     pub cpus_per_unit: u16,
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, allow(dead_code))]
 struct HostCacheStore {
     cache_dir: PathBuf,
 }
@@ -114,7 +115,7 @@ impl CacheEntry {
         }
 
         if let Ok(number_of_sets) = store.get_by_key(index, "number_of_sets") {
-            cache.number_of_sets = Some(number_of_sets.parse::<u16>().map_err(|err| {
+            cache.number_of_sets = Some(number_of_sets.parse::<u32>().map_err(|err| {
                 CacheInfoError::InvalidCacheAttr("number_of_sets".to_string(), err.to_string())
             })?);
         } else {
@@ -206,17 +207,18 @@ impl CacheType {
     }
 }
 
+#[cfg_attr(test, allow(unused))]
 fn readln_special<T: AsRef<Path>>(file_path: &T) -> Result<String, CacheInfoError> {
     let line = fs::read_to_string(file_path)?;
     Ok(line.trim_end().to_string())
 }
 
-fn to_bytes(cache_size_pretty: &mut String) -> Result<usize, CacheInfoError> {
+fn to_bytes(cache_size_pretty: &mut String) -> Result<u32, CacheInfoError> {
     match cache_size_pretty.pop() {
-        Some('K') => Ok(cache_size_pretty.parse::<usize>().map_err(|err| {
+        Some('K') => Ok(cache_size_pretty.parse::<u32>().map_err(|err| {
             CacheInfoError::InvalidCacheAttr("size".to_string(), err.to_string())
         })? * 1024),
-        Some('M') => Ok(cache_size_pretty.parse::<usize>().map_err(|err| {
+        Some('M') => Ok(cache_size_pretty.parse::<u32>().map_err(|err| {
             CacheInfoError::InvalidCacheAttr("size".to_string(), err.to_string())
         })? * 1024
             * 1024),
@@ -248,11 +250,14 @@ fn mask_str2bit_count(mask_str: &str) -> Result<u16, CacheInfoError> {
         if s_zero_free.is_empty() {
             s_zero_free = "0";
         }
-        bit_count += u32::from_str_radix(s_zero_free, 16)
-            .map_err(|err| {
-                CacheInfoError::InvalidCacheAttr("shared_cpu_map".to_string(), err.to_string())
-            })?
-            .count_ones() as u16;
+        bit_count += u16::try_from(
+            u32::from_str_radix(s_zero_free, 16)
+                .map_err(|err| {
+                    CacheInfoError::InvalidCacheAttr("shared_cpu_map".to_string(), err.to_string())
+                })?
+                .count_ones(),
+        )
+        .unwrap(); // Safe because this is at most 32
     }
     if bit_count == 0 {
         return Err(CacheInfoError::InvalidCacheAttr(
@@ -369,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_mask_str2bit_count() {
-        assert!(mask_str2bit_count("00000000,00000001").is_ok());
+        mask_str2bit_count("00000000,00000001").unwrap();
         let res = mask_str2bit_count("00000000,00000000");
 
         assert!(
@@ -389,8 +394,8 @@ mod tests {
 
     #[test]
     fn test_to_bytes() {
-        assert!(to_bytes(&mut "64K".to_string()).is_ok());
-        assert!(to_bytes(&mut "64M".to_string()).is_ok());
+        to_bytes(&mut "64K".to_string()).unwrap();
+        to_bytes(&mut "64M".to_string()).unwrap();
 
         match to_bytes(&mut "64KK".to_string()) {
             Err(err) => assert_eq!(
@@ -423,13 +428,11 @@ mod tests {
         map1.remove("index0/type");
         let engine = CacheEngine::new(&map1);
         let res = CacheEntry::from_index(0, engine.store.as_ref());
-        assert!(res.is_err());
         // We did create the level file but we still do not have the type file.
         assert!(matches!(res.unwrap_err(), CacheInfoError::MissingCacheType));
 
         let engine = CacheEngine::new(&default_map);
         let res = CacheEntry::from_index(0, engine.store.as_ref());
-        assert!(res.is_err());
         assert_eq!(
             format!("{}", res.unwrap_err()),
             "shared cpu map, coherency line size, size, number of sets",
@@ -569,7 +572,7 @@ mod tests {
         let mut l1_caches: Vec<CacheEntry> = Vec::new();
         let mut non_l1_caches: Vec<CacheEntry> = Vec::new();
         // We use sysfs for extracting the cache information.
-        assert!(read_cache_config(&mut l1_caches, &mut non_l1_caches).is_ok());
+        read_cache_config(&mut l1_caches, &mut non_l1_caches).unwrap();
         assert_eq!(l1_caches.len(), 2);
         assert_eq!(l1_caches.len(), 2);
     }

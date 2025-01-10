@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests that ensure the correctness of the command line parameters."""
 
-import platform
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from framework.utils import run_cmd
-from host_tools.cargo_build import get_firecracker_binaries
+from framework.utils import check_output
+from host_tools.fcmetrics import validate_fc_metrics
 
 
 def test_describe_snapshot_all_versions(
@@ -20,6 +20,7 @@ def test_describe_snapshot_all_versions(
     For each release create a snapshot and verify the data version of the
     snapshot state file.
     """
+
     target_version = firecracker_release.snapshot_version
     vm = microvm_factory.build(
         guest_kernel,
@@ -35,12 +36,11 @@ def test_describe_snapshot_all_versions(
     print(vm.log_data)
     vm.kill()
 
-    # Fetch Firecracker binary for the latest version
-    fc_binary, _ = get_firecracker_binaries()
+    # Fetch Firecracker binary
+    fc_binary = microvm_factory.fc_binary_path
     # Verify the output of `--describe-snapshot` command line parameter
     cmd = [fc_binary] + ["--describe-snapshot", snapshot.vmstate]
-    code, stdout, stderr = run_cmd(cmd)
-    assert code == 0, stderr
+    _, stdout, stderr = check_output(cmd)
     assert stderr == ""
     assert target_version in stdout
 
@@ -55,43 +55,16 @@ def test_cli_metrics_path(uvm_plain):
     microvm.basic_config()
     microvm.start()
     metrics = microvm.flush_metrics()
-
-    exp_keys = [
-        "utc_timestamp_ms",
-        "api_server",
-        "balloon",
-        "block",
-        "deprecated_api",
-        "get_api_requests",
-        "i8042",
-        "latencies_us",
-        "logger",
-        "mmds",
-        "net",
-        "patch_api_requests",
-        "put_api_requests",
-        "seccomp",
-        "vcpu",
-        "vmm",
-        "uart",
-        "signals",
-        "vsock",
-        "entropy",
-    ]
-
-    if platform.machine() == "aarch64":
-        exp_keys.append("rtc")
-
-    assert set(metrics.keys()) == set(exp_keys)
+    validate_fc_metrics(metrics)
 
 
-def test_cli_metrics_path_if_metrics_initialized_twice_fail(test_microvm_with_api):
+def test_cli_metrics_path_if_metrics_initialized_twice_fail(uvm_plain):
     """
     Given: a running firecracker with metrics configured with the CLI option
     When: Configure metrics via API
     Then: API returns an error
     """
-    microvm = test_microvm_with_api
+    microvm = uvm_plain
 
     # First configure the µvm metrics with --metrics-path
     metrics_path = Path(microvm.path) / "metrics.ndjson"
@@ -123,10 +96,23 @@ def test_cli_metrics_if_resume_no_metrics(uvm_plain, microvm_factory):
     snapshot = uvm1.snapshot_full()
 
     # When: restoring from the snapshot
-    uvm2 = microvm_factory.build()
-    uvm2.spawn()
-    uvm2.restore_from_snapshot(snapshot)
+    uvm2 = microvm_factory.build_from_snapshot(snapshot)
 
     # Then: the old metrics configuration does not exist
     metrics2 = Path(uvm2.jailer.chroot_path()) / metrics_path.name
     assert not metrics2.exists()
+
+
+def test_cli_no_params(microvm_factory):
+    """
+    Test running firecracker with no parameters should work
+    """
+
+    fc_binary = microvm_factory.fc_binary_path
+    process = subprocess.Popen(fc_binary)
+    try:
+        process.communicate(timeout=3)
+        assert process.returncode is None
+    except subprocess.TimeoutExpired:
+        # The good case
+        process.kill()

@@ -58,7 +58,7 @@ sed -i "s/\[Unreleased\]/\[$version\]/g" "$FC_ROOT_DIR/CHANGELOG.md"
 
 # Add all changed files
 git add -u
-git commit -s -m "chore: release v$version"
+git commit -s -m "chore: release v$version" -m "Update version number / CHANGELOG / CREDITS"
 
 
 # pretty print code
@@ -83,7 +83,7 @@ $(pp-li 1. Check the changes made to the repo:)
 
 $(pp-li 2. Preview the release notes)
 
-   $(pp-code ./tools/release-notes.sh "$version")
+   $(pp-code ./tools/release-notes.py "$version")
 
 $(pp-li 3. If you want to undo the changes, run)
 

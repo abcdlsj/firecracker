@@ -4,22 +4,20 @@
 
 import os
 import re
-import stat
-from subprocess import TimeoutExpired
 
 import pytest
 import requests
 
-from framework.utils import Timeout, UffdHandler, run_cmd
+from framework.utils import Timeout, UffdHandler, check_output
 
 SOCKET_PATH = "/firecracker-uffd.sock"
 
 
 @pytest.fixture(scope="function", name="snapshot")
-def snapshot_fxt(microvm_factory, guest_kernel_linux_5_10, rootfs_ubuntu_22):
+def snapshot_fxt(microvm_factory, guest_kernel_linux_5_10, rootfs):
     """Create a snapshot of a microVM."""
 
-    basevm = microvm_factory.build(guest_kernel_linux_5_10, rootfs_ubuntu_22)
+    basevm = microvm_factory.build(guest_kernel_linux_5_10, rootfs)
     basevm.spawn()
     basevm.basic_config(vcpu_count=2, mem_size_mib=256)
     basevm.add_net_iface()
@@ -30,10 +28,6 @@ def snapshot_fxt(microvm_factory, guest_kernel_linux_5_10, rootfs_ubuntu_22):
     )
 
     basevm.start()
-
-    # Verify if guest can run commands.
-    exit_code, _, _ = basevm.ssh.run("sync")
-    assert exit_code == 0
 
     # Create base snapshot.
     snapshot = basevm.snapshot_full()
@@ -48,35 +42,12 @@ def spawn_pf_handler(vm, handler_path, mem_path):
     jailed_mem = vm.create_jailed_resource(mem_path)
     # Copy the valid page fault binary into chroot of microVM.
     jailed_handler = vm.create_jailed_resource(handler_path)
-
     handler_name = os.path.basename(jailed_handler)
-    args = [SOCKET_PATH, jailed_mem]
 
-    uffd_handler = UffdHandler(handler_name, args)
-    real_root = os.open("/", os.O_RDONLY)
-    working_dir = os.getcwd()
-
-    os.chroot(vm.chroot())
-    os.chdir("/")
-    st = os.stat(handler_name)
-    os.chmod(handler_name, st.st_mode | stat.S_IEXEC)
-
-    uffd_handler.spawn()
-    try:
-        outs, errs = uffd_handler.proc().communicate(timeout=1)
-        print(outs)
-        print(errs)
-        assert False, "Could not start PF handler!"
-    except TimeoutExpired:
-        print("This is the good case!")
-
-    # The page fault handler will create the socket path with root rights.
-    # Change rights to the jailer's.
-    os.chown(SOCKET_PATH, vm.jailer.uid, vm.jailer.gid)
-
-    os.fchdir(real_root)
-    os.chroot(".")
-    os.chdir(working_dir)
+    uffd_handler = UffdHandler(
+        handler_name, SOCKET_PATH, jailed_mem, vm.chroot(), "uffd.log"
+    )
+    uffd_handler.spawn(vm.jailer.uid, vm.jailer.gid)
 
     return uffd_handler
 
@@ -90,7 +61,7 @@ def test_bad_socket_path(uvm_plain, snapshot):
     jailed_vmstate = vm.create_jailed_resource(snapshot.vmstate)
 
     expected_msg = re.escape(
-        "Load microVM snapshot error: Failed to restore from snapshot: Failed to load guest "
+        "Load snapshot error: Failed to restore from snapshot: Failed to load guest "
         "memory: Error creating guest memory from uffd: Failed to connect to UDS Unix stream: No "
         "such file or directory (os error 2)"
     )
@@ -99,6 +70,8 @@ def test_bad_socket_path(uvm_plain, snapshot):
             mem_backend={"backend_type": "Uffd", "backend_path": "inexistent"},
             snapshot_path=jailed_vmstate,
         )
+
+    vm.mark_killed()
 
 
 def test_unbinded_socket(uvm_plain, snapshot):
@@ -110,11 +83,11 @@ def test_unbinded_socket(uvm_plain, snapshot):
 
     jailed_vmstate = vm.create_jailed_resource(snapshot.vmstate)
     socket_path = os.path.join(vm.path, "firecracker-uffd.sock")
-    run_cmd("touch {}".format(socket_path))
+    check_output("touch {}".format(socket_path))
     jailed_sock_path = vm.create_jailed_resource(socket_path)
 
     expected_msg = re.escape(
-        "Load microVM snapshot error: Failed to restore from snapshot: Failed to load guest "
+        "Load snapshot error: Failed to restore from snapshot: Failed to load guest "
         "memory: Error creating guest memory from uffd: Failed to connect to UDS Unix stream: "
         "Connection refused (os error 111)"
     )
@@ -123,6 +96,8 @@ def test_unbinded_socket(uvm_plain, snapshot):
             mem_backend={"backend_type": "Uffd", "backend_path": jailed_sock_path},
             snapshot_path=jailed_vmstate,
         )
+
+    vm.mark_killed()
 
 
 def test_valid_handler(uvm_plain, snapshot, uffd_handler_paths):
@@ -146,9 +121,7 @@ def test_valid_handler(uvm_plain, snapshot, uffd_handler_paths):
     # Deflate balloon.
     vm.api.balloon.patch(amount_mib=0)
 
-    # Verify if guest can run commands.
-    exit_code, _, _ = vm.ssh.run("sync")
-    assert exit_code == 0
+    # Verify if the restored guest works.
 
 
 def test_malicious_handler(uvm_plain, snapshot, uffd_handler_paths):

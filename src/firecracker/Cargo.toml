@@ -1,6 +1,6 @@
 [package]
 name = "firecracker"
-version = "1.5.0-dev"
+version = "1.11.0-dev"
 authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
 edition = "2021"
 build = "build.rs"
@@ -12,33 +12,47 @@ license = "Apache-2.0"
 name = "firecracker"
 bench = false
 
-[dependencies]
-displaydoc = "0.2.4"
-event-manager = "0.3.0"
-libc = "0.2.148"
-serde_json = "1.0.107"
-thiserror = "1.0.48"
-timerfd = "1.5.0"
+[lib]
+bench = false
 
-api_server = { path = "../api_server" }
+[dependencies]
+displaydoc = "0.2.5"
+event-manager = "0.4.0"
+libc = "0.2.169"
+log-instrument = { path = "../log-instrument", optional = true }
+micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
+
 seccompiler = { path = "../seccompiler" }
-snapshot = { path = "../snapshot" }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_derive = "1.0.136"
+serde_json = "1.0.134"
+thiserror = "2.0.9"
+timerfd = "1.6.0"
 utils = { path = "../utils" }
 vmm = { path = "../vmm" }
+vmm-sys-util = { version = "0.12.1", features = ["with-serde"] }
 
 [dev-dependencies]
-cargo_toml = "0.16.0"
-regex = { version = "1.9.5", default-features = false, features = ["std", "unicode-perl"] }
+cargo_toml = "0.21.0"
+libc = "0.2.169"
+regex = { version = "1.11.1", default-features = false, features = ["std", "unicode-perl"] }
 
 # Dev-Dependencies for uffd examples
-serde = { version = "1.0.188", features = ["derive"] }
-userfaultfd = "0.6.1"
+serde = { version = "1.0.217", features = ["derive"] }
+userfaultfd = "0.8.1"
 
 [build-dependencies]
 bincode = "1.2.1"
 seccompiler = { path = "../seccompiler" }
-serde = { version = "1.0.188" }
-serde_json = "1.0.107"
+serde = { version = "1.0.217" }
+serde_json = "1.0.134"
+
+[features]
+tracing = ["log-instrument", "seccompiler/tracing", "utils/tracing", "vmm/tracing"]
+gdb = ["vmm/gdb"]
+
+[lints]
+workspace = true
 
 [[example]]
 name = "uffd_malicious_handler"
@@ -47,6 +61,10 @@ path = "examples/uffd/malicious_handler.rs"
 [[example]]
 name = "uffd_valid_handler"
 path = "examples/uffd/valid_handler.rs"
+
+[[example]]
+name = "uffd_fault_all_handler"
+path = "examples/uffd/fault_all_handler.rs"
 
 [[example]]
 name = "seccomp_harmless"

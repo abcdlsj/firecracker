@@ -17,7 +17,7 @@ function create_local_tag {
     branch="$2"
 
     say "Obtaining tag description for local tag v$version..."
-    tag_text=$($FC_TOOLS_DIR/release-notes.sh "$version")
+    tag_text=$($FC_TOOLS_DIR/release-notes.py "$version")
     say "Tag description for v$version:"
     echo "$tag_text"
     # Create tag.
@@ -61,5 +61,5 @@ warn "!WARNING! The next step will modify upstream: $UPSTREAM_URL by running:"
 echo "    git push $UPSTREAM v$version"
 echo "    git push $UPSTREAM $RELEASE_BRANCH"
 get_user_confirmation || die "Cancelling tag push"
-git push $UPSTREAM "v$version"
-git push $UPSTREAM "$RELEASE_BRANCH"
+git push --atomic $UPSTREAM "v$version"
+git push --atomic $UPSTREAM "$RELEASE_BRANCH"

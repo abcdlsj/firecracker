@@ -3,15 +3,13 @@
 
 //! Defines the structures needed for saving/restoring a RateLimiter.
 
-use snapshot::Persist;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
+use serde::{Deserialize, Serialize};
 
 use super::*;
+use crate::snapshot::Persist;
 
-// NOTICE: Any changes to this structure require a snapshot version bump.
 /// State for saving a TokenBucket.
-#[derive(Debug, Clone, Versionize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBucketState {
     size: u64,
     one_time_burst: u64,
@@ -31,7 +29,8 @@ impl Persist<'_> for TokenBucket {
             one_time_burst: self.one_time_burst,
             refill_time: self.refill_time,
             budget: self.budget,
-            elapsed_ns: self.last_update.elapsed().as_nanos() as u64,
+            // This should be safe for a duration of about 584 years.
+            elapsed_ns: u64::try_from(self.last_update.elapsed().as_nanos()).unwrap(),
         }
     }
 
@@ -52,9 +51,8 @@ impl Persist<'_> for TokenBucket {
     }
 }
 
-// NOTICE: Any changes to this structure require a snapshot version bump.
 /// State for saving a RateLimiter.
-#[derive(Debug, Clone, Versionize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimiterState {
     ops: Option<TokenBucketState>,
     bandwidth: Option<TokenBucketState>,
@@ -94,7 +92,9 @@ impl Persist<'_> for RateLimiter {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::snapshot::Snapshot;
 
     #[test]
     fn test_token_bucket_persistence() {
@@ -116,16 +116,10 @@ mod tests {
 
         // Test serialization.
         let mut mem = vec![0; 4096];
-        let version_map = VersionMap::new();
-        tb.save()
-            .serialize(&mut mem.as_mut_slice(), &version_map, 1)
-            .unwrap();
+        Snapshot::serialize(&mut mem.as_mut_slice(), &tb.save()).unwrap();
 
-        let restored_tb = TokenBucket::restore(
-            (),
-            &TokenBucketState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
-        )
-        .unwrap();
+        let restored_tb =
+            TokenBucket::restore((), &Snapshot::deserialize(&mut mem.as_slice()).unwrap()).unwrap();
         assert!(tb.partial_eq(&restored_tb));
     }
 
@@ -186,16 +180,9 @@ mod tests {
 
         // Test serialization.
         let mut mem = vec![0; 4096];
-        let version_map = VersionMap::new();
-        rate_limiter
-            .save()
-            .serialize(&mut mem.as_mut_slice(), &version_map, 1)
-            .unwrap();
-        let restored_rate_limiter = RateLimiter::restore(
-            (),
-            &RateLimiterState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
-        )
-        .unwrap();
+        Snapshot::serialize(&mut mem.as_mut_slice(), &rate_limiter.save()).unwrap();
+        let restored_rate_limiter =
+            RateLimiter::restore((), &Snapshot::deserialize(&mut mem.as_slice()).unwrap()).unwrap();
 
         assert!(rate_limiter
             .ops()

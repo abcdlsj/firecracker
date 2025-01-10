@@ -11,24 +11,24 @@ use std::result::Result;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use utils::net::mac::MacAddr;
 use utils::time::timestamp_cycles;
 
 use crate::dumbo::pdu::arp::{
-    test_speculative_tpa, Error as ArpFrameError, EthIPv4ArpFrame, ETH_IPV4_FRAME_LEN,
+    test_speculative_tpa, ArpError as ArpFrameError, EthIPv4ArpFrame, ETH_IPV4_FRAME_LEN,
 };
 use crate::dumbo::pdu::ethernet::{
-    Error as EthernetFrameError, EthernetFrame, ETHERTYPE_ARP, ETHERTYPE_IPV4,
+    EthernetError as EthernetFrameError, EthernetFrame, ETHERTYPE_ARP, ETHERTYPE_IPV4,
 };
 use crate::dumbo::pdu::ipv4::{
-    test_speculative_dst_addr, Error as IPv4PacketError, IPv4Packet, PROTOCOL_TCP,
+    test_speculative_dst_addr, IPv4Packet, Ipv4Error as IPv4PacketError, PROTOCOL_TCP,
 };
-use crate::dumbo::pdu::tcp::Error as TcpSegmentError;
+use crate::dumbo::pdu::tcp::TcpError as TcpSegmentError;
 use crate::dumbo::pdu::Incomplete;
 use crate::dumbo::tcp::handler::{RecvEvent, TcpIPv4Handler, WriteEvent, WriteNextError};
 use crate::dumbo::tcp::NextSegmentStatus;
 use crate::logger::{IncMetric, METRICS};
 use crate::mmds::data_store::Mmds;
+use crate::utils::net::mac::MacAddr;
 
 const DEFAULT_MAC_ADDR: &str = "06:01:23:45:67:01";
 const DEFAULT_IPV4_ADDR: [u8; 4] = [169, 254, 169, 254];
@@ -36,19 +36,26 @@ const DEFAULT_TCP_PORT: u16 = 80;
 const DEFAULT_MAX_CONNECTIONS: usize = 30;
 const DEFAULT_MAX_PENDING_RESETS: usize = 100;
 
-#[derive(Debug, PartialEq, derive_more::From)]
+#[derive(Debug, PartialEq, thiserror::Error, displaydoc::Display)]
 enum WriteArpFrameError {
+    /// NoPendingArpReply
     NoPendingArpReply,
-    Arp(ArpFrameError),
-    Ethernet(EthernetFrameError),
+    /// ARP error: {0}
+    Arp(#[from] ArpFrameError),
+    /// Ethernet error: {0}
+    Ethernet(#[from] EthernetFrameError),
 }
 
-#[derive(Debug, PartialEq, derive_more::From)]
+#[derive(Debug, PartialEq, thiserror::Error, displaydoc::Display)]
 enum WritePacketError {
-    IPv4Packet(IPv4PacketError),
-    Ethernet(EthernetFrameError),
-    TcpSegment(TcpSegmentError),
-    WriteNext(WriteNextError),
+    /// IPv4Packet error: {0}
+    IPv4Packet(#[from] IPv4PacketError),
+    /// Ethernet error: {0}
+    Ethernet(#[from] EthernetFrameError),
+    /// TcpSegment error: {0}
+    TcpSegment(#[from] TcpSegmentError),
+    /// WriteNext error: {0}
+    WriteNext(#[from] WriteNextError),
 }
 
 #[derive(Debug)]
@@ -74,8 +81,6 @@ impl MmdsNetworkStack {
         mac_addr: MacAddr,
         ipv4_addr: Ipv4Addr,
         tcp_port: u16,
-        max_connections: NonZeroUsize,
-        max_pending_resets: NonZeroUsize,
         mmds: Arc<Mutex<Mmds>>,
     ) -> Self {
         MmdsNetworkStack {
@@ -86,8 +91,8 @@ impl MmdsNetworkStack {
             tcp_handler: TcpIPv4Handler::new(
                 ipv4_addr,
                 tcp_port,
-                max_connections,
-                max_pending_resets,
+                NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS).unwrap(),
+                NonZeroUsize::new(DEFAULT_MAX_PENDING_RESETS).unwrap(),
             ),
             mmds,
         }
@@ -98,14 +103,7 @@ impl MmdsNetworkStack {
         let ipv4_addr = mmds_ipv4_addr.unwrap_or_else(|| Ipv4Addr::from(DEFAULT_IPV4_ADDR));
 
         // The unwrap()s are safe because the given literals are greater than 0.
-        Self::new(
-            mac_addr,
-            ipv4_addr,
-            DEFAULT_TCP_PORT,
-            NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS).unwrap(),
-            NonZeroUsize::new(DEFAULT_MAX_PENDING_RESETS).unwrap(),
-            mmds,
-        )
+        Self::new(mac_addr, ipv4_addr, DEFAULT_TCP_PORT, mmds)
     }
 
     pub fn set_ipv4_addr(&mut self, ipv4_addr: Ipv4Addr) {
@@ -555,14 +553,8 @@ mod tests {
         let ip = Ipv4Addr::from(DEFAULT_IPV4_ADDR);
         let other_ip = Ipv4Addr::new(5, 6, 7, 8);
         let mac = MacAddr::from_bytes_unchecked(&[0; 6]);
-        let mut ns = MmdsNetworkStack::new(
-            mac,
-            ip,
-            DEFAULT_TCP_PORT,
-            NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS).unwrap(),
-            NonZeroUsize::new(DEFAULT_MAX_PENDING_RESETS).unwrap(),
-            Arc::new(Mutex::new(Mmds::default())),
-        );
+        let mut ns =
+            MmdsNetworkStack::new_with_defaults(Some(ip), Arc::new(Mutex::new(Mmds::default())));
 
         let mut eth =
             EthernetFrame::write_incomplete(buf.as_mut(), mac, mac, ETHERTYPE_ARP).unwrap();
@@ -582,14 +574,8 @@ mod tests {
         let ip = Ipv4Addr::from(DEFAULT_IPV4_ADDR);
         let other_ip = Ipv4Addr::new(5, 6, 7, 8);
         let mac = MacAddr::from_bytes_unchecked(&[0; 6]);
-        let ns = MmdsNetworkStack::new(
-            mac,
-            ip,
-            DEFAULT_TCP_PORT,
-            NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS).unwrap(),
-            NonZeroUsize::new(DEFAULT_MAX_PENDING_RESETS).unwrap(),
-            Arc::new(Mutex::new(Mmds::default())),
-        );
+        let ns =
+            MmdsNetworkStack::new_with_defaults(Some(ip), Arc::new(Mutex::new(Mmds::default())));
 
         let mut eth =
             EthernetFrame::write_incomplete(buf.as_mut(), mac, mac, ETHERTYPE_IPV4).unwrap();
@@ -608,14 +594,8 @@ mod tests {
         let ip = Ipv4Addr::from(DEFAULT_IPV4_ADDR);
         let other_ip = Ipv4Addr::new(5, 6, 7, 8);
         let mac = MacAddr::from_bytes_unchecked(&[0; 6]);
-        let mut ns = MmdsNetworkStack::new(
-            mac,
-            ip,
-            DEFAULT_TCP_PORT,
-            NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS).unwrap(),
-            NonZeroUsize::new(DEFAULT_MAX_PENDING_RESETS).unwrap(),
-            Arc::new(Mutex::new(Mmds::default())),
-        );
+        let mut ns =
+            MmdsNetworkStack::new_with_defaults(Some(ip), Arc::new(Mutex::new(Mmds::default())));
 
         // try IPv4 with detour_arp
         let mut eth =

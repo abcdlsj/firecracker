@@ -13,12 +13,13 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use log::{error, warn};
-use utils::epoll::EventSet;
+use serde::Serialize;
 use vm_superio::serial::{Error as SerialError, SerialEvents};
 use vm_superio::{Serial, Trigger};
+use vmm_sys_util::epoll::EventSet;
 
 use crate::devices::legacy::EventFdTrigger;
-use crate::logger::{IncMetric, METRICS};
+use crate::logger::{IncMetric, SharedIncMetric};
 
 /// Received Data Available interrupt - for letting the driver know that
 /// there is some pending data to be processed.
@@ -26,8 +27,42 @@ pub const IER_RDA_BIT: u8 = 0b0000_0001;
 /// Received Data Available interrupt offset
 pub const IER_RDA_OFFSET: u8 = 1;
 
-#[derive(Debug)]
+/// Metrics specific to the UART device.
+#[derive(Debug, Serialize, Default)]
+pub struct SerialDeviceMetrics {
+    /// Errors triggered while using the UART device.
+    pub error_count: SharedIncMetric,
+    /// Number of flush operations.
+    pub flush_count: SharedIncMetric,
+    /// Number of read calls that did not trigger a read.
+    pub missed_read_count: SharedIncMetric,
+    /// Number of write calls that did not trigger a write.
+    pub missed_write_count: SharedIncMetric,
+    /// Number of succeeded read calls.
+    pub read_count: SharedIncMetric,
+    /// Number of succeeded write calls.
+    pub write_count: SharedIncMetric,
+}
+impl SerialDeviceMetrics {
+    /// Const default construction.
+    pub const fn new() -> Self {
+        Self {
+            error_count: SharedIncMetric::new(),
+            flush_count: SharedIncMetric::new(),
+            missed_read_count: SharedIncMetric::new(),
+            missed_write_count: SharedIncMetric::new(),
+            read_count: SharedIncMetric::new(),
+            write_count: SharedIncMetric::new(),
+        }
+    }
+}
+
+/// Stores aggregated metrics
+pub(super) static METRICS: SerialDeviceMetrics = SerialDeviceMetrics::new();
+
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum RawIOError {
+    /// Serial error: {0:?}
     Serial(SerialError<io::Error>),
 }
 
@@ -62,15 +97,15 @@ pub struct SerialEventsWrapper {
 
 impl SerialEvents for SerialEventsWrapper {
     fn buffer_read(&self) {
-        METRICS.uart.read_count.inc();
+        METRICS.read_count.inc();
     }
 
     fn out_byte(&self) {
-        METRICS.uart.write_count.inc();
+        METRICS.write_count.inc();
     }
 
     fn tx_lost_byte(&self) {
-        METRICS.uart.missed_write_count.inc();
+        METRICS.missed_write_count.inc();
     }
 
     fn in_buffer_empty(&self) {
@@ -306,22 +341,22 @@ impl<I: Read + AsRawFd + Send + Debug + 'static>
     SerialWrapper<EventFdTrigger, SerialEventsWrapper, I>
 {
     pub fn bus_read(&mut self, offset: u64, data: &mut [u8]) {
-        if data.len() != 1 {
-            METRICS.uart.missed_read_count.inc();
-            return;
+        if let (Ok(offset), 1) = (u8::try_from(offset), data.len()) {
+            data[0] = self.serial.read(offset);
+        } else {
+            METRICS.missed_read_count.inc();
         }
-        data[0] = self.serial.read(offset as u8);
     }
 
     pub fn bus_write(&mut self, offset: u64, data: &[u8]) {
-        if data.len() != 1 {
-            METRICS.uart.missed_write_count.inc();
-            return;
-        }
-        if let Err(err) = self.serial.write(offset as u8, data[0]) {
-            // Counter incremented for any handle_write() error.
-            error!("Failed the write to serial: {:?}", err);
-            METRICS.uart.error_count.inc();
+        if let (Ok(offset), 1) = (u8::try_from(offset), data.len()) {
+            if let Err(err) = self.serial.write(offset, data[0]) {
+                // Counter incremented for any handle_write() error.
+                error!("Failed the write to serial: {:?}", err);
+                METRICS.error_count.inc();
+            }
+        } else {
+            METRICS.missed_write_count.inc();
         }
     }
 }
@@ -330,15 +365,16 @@ impl<I: Read + AsRawFd + Send + Debug + 'static>
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
-    use utils::eventfd::EventFd;
+    use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
+    use crate::logger::IncMetric;
 
     #[test]
     fn test_serial_bus_read() {
         let intr_evt = EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
 
-        let metrics = &METRICS.uart;
+        let metrics = &METRICS;
 
         let mut serial = SerialDevice {
             serial: Serial::with_events(
@@ -350,7 +386,7 @@ mod tests {
             ),
             input: None::<std::io::Stdin>,
         };
-        serial.serial.raw_input(&[b'a', b'b', b'c']).unwrap();
+        serial.serial.raw_input(b"abc").unwrap();
 
         let invalid_reads_before = metrics.missed_read_count.count();
         let mut v = [0x00; 2];
@@ -383,7 +419,20 @@ mod tests {
         assert!(is_fifo(fds[1]));
 
         // Files arent fifos
-        let tmp_file = utils::tempfile::TempFile::new().unwrap();
+        let tmp_file = vmm_sys_util::tempfile::TempFile::new().unwrap();
         assert!(!is_fifo(tmp_file.as_file().as_raw_fd()));
+    }
+
+    #[test]
+    fn test_serial_dev_metrics() {
+        let serial_metrics: SerialDeviceMetrics = SerialDeviceMetrics::new();
+        let serial_metrics_local: String = serde_json::to_string(&serial_metrics).unwrap();
+        // the 1st serialize flushes the metrics and resets values to 0 so that
+        // we can compare the values with local metrics.
+        serde_json::to_string(&METRICS).unwrap();
+        let serial_metrics_global: String = serde_json::to_string(&METRICS).unwrap();
+        assert_eq!(serial_metrics_local, serial_metrics_global);
+        serial_metrics.read_count.inc();
+        assert_eq!(serial_metrics.read_count.count(), 1);
     }
 }

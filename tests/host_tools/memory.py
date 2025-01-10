@@ -46,6 +46,12 @@ class MemoryMonitor(Thread):
         """Signal that the thread should stop."""
         self._should_stop = True
 
+    def stop(self):
+        """Stop the thread"""
+        if self.is_alive():
+            self.signal_stop()
+            self.join(timeout=1)
+
     def run(self):
         """Thread for monitoring the RSS memory usage of a Firecracker process.
 
@@ -55,7 +61,7 @@ class MemoryMonitor(Thread):
 
         guest_mem_bytes = self._vm.mem_size_bytes
         try:
-            ps = psutil.Process(self._vm.jailer_clone_pid)
+            ps = psutil.Process(self._vm.firecracker_pid)
         except psutil.NoSuchProcess:
             return
         while not self._should_stop:

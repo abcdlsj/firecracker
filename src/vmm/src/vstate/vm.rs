@@ -16,89 +16,66 @@ use kvm_bindings::{
 };
 use kvm_bindings::{kvm_userspace_memory_region, KVM_API_VERSION, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::{Kvm, VmFd};
-use utils::vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::gic::GICDevice;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::gic::GicState;
 use crate::cpu_config::templates::KvmCapability;
+#[cfg(target_arch = "x86_64")]
+use crate::utils::u64_to_usize;
+use crate::vstate::memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 /// Errors associated with the wrappers over KVM ioctls.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+/// Needs `rustfmt::skip` to make multiline comments work
+#[rustfmt::skip]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum VmError {
-    /// The host kernel reports an invalid KVM API version.
-    #[error("The host kernel reports an invalid KVM API version: {0}")]
+    /// The host kernel reports an invalid KVM API version: {0}
     ApiVersion(i32),
-    /// Cannot initialize the KVM context due to missing capabilities.
-    #[error("Missing KVM capabilities: {0:x?}")]
+    /// Missing KVM capabilities: {0:#x?}
     Capabilities(u32),
-    /// Cannot initialize the KVM context.
-    #[error("{}", ({
-        if .0.errno() == libc::EACCES {
-            format!(
-                "Error creating KVM object. [{}]\nMake sure the user \
-                launching the firecracker process is configured on the /dev/kvm file's ACL.",
-                .0
-            )
-        } else {
-            format!("Error creating KVM object. [{}]", .0)
-        }
-    }))]
+    /**  Error creating KVM object: {0} Make sure the user launching the firecracker process is \
+    configured on the /dev/kvm file's ACL. */
     Kvm(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to get MSR index list to save into snapshots.
-    #[error("Failed to get MSR index list to save into snapshots: {0}")]
+    /// Failed to get MSR index list to save into snapshots: {0}
     GetMsrsToSave(#[from] crate::arch::x86_64::msr::MsrError),
-    /// The number of configured slots is bigger than the maximum reported by KVM.
-    #[error("The number of configured slots is bigger than the maximum reported by KVM")]
+    /// The number of configured slots is bigger than the maximum reported by KVM
     NotEnoughMemorySlots,
-    /// Cannot set the memory regions.
-    #[error("Cannot set the memory regions: {0}")]
+    /// Cannot set the memory regions: {0}
     SetUserMemoryRegion(kvm_ioctls::Error),
     #[cfg(target_arch = "aarch64")]
-    /// Cannot create the global interrupt controller.
-    #[error("Error creating the global interrupt controller: {0:?}")]
+    /// Error creating the global interrupt controller: {0}
     VmCreateGIC(crate::arch::aarch64::gic::GicError),
-    /// Cannot open the VM file descriptor.
-    #[error("Cannot open the VM file descriptor: {0}")]
+    /// Cannot open the VM file descriptor: {0}
     VmFd(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vm pit state.
-    #[error("Failed to get KVM vm pit state: {0}")]
+    /// Failed to get KVM vm pit state: {0}
     VmGetPit2(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vm clock.
-    #[error("Failed to get KVM vm clock: {0}")]
+    /// Failed to get KVM vm clock: {0}
     VmGetClock(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vm irqchip.
-    #[error("Failed to get KVM vm irqchip: {0}")]
+    /// Failed to get KVM vm irqchip: {0}
     VmGetIrqChip(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vm pit state.
-    #[error("Failed to set KVM vm pit state: {0}")]
+    /// Failed to set KVM vm pit state: {0}
     VmSetPit2(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vm clock.
-    #[error("Failed to set KVM vm clock: {0}")]
+    /// Failed to set KVM vm clock: {0}
     VmSetClock(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vm irqchip.
-    #[error("Failed to set KVM vm irqchip: {0}")]
+    /// Failed to set KVM vm irqchip: {0}
     VmSetIrqChip(kvm_ioctls::Error),
-    /// Cannot configure the microvm.
-    #[error("Cannot configure the microvm: {0}")]
+    /// Cannot configure the microvm: {0}
     VmSetup(kvm_ioctls::Error),
     #[cfg(target_arch = "aarch64")]
-    /// Failed to save the VM's GIC state.
-    #[error("Failed to save the VM's GIC state: {0:?}")]
+    /// Failed to save the VM's GIC state: {0}
     SaveGic(crate::arch::aarch64::gic::GicError),
     #[cfg(target_arch = "aarch64")]
-    /// Failed to restore the VM's GIC state.
-    #[error("Failed to restore the VM's GIC state: {0:?}")]
+    /// Failed to restore the VM's GIC state: {0}
     RestoreGic(crate::arch::aarch64::gic::GicError),
 }
 
@@ -107,17 +84,17 @@ pub enum VmError {
 #[cfg(target_arch = "x86_64")]
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
 pub enum RestoreStateError {
-    /// {0}
+    /// Set PIT2 error: {0}
     SetPit2(kvm_ioctls::Error),
-    /// {0}
+    /// Set clock error: {0}
     SetClock(kvm_ioctls::Error),
-    /// {0}
+    /// Set IrqChipPicMaster error: {0}
     SetIrqChipPicMaster(kvm_ioctls::Error),
-    /// {0}
+    /// Set IrqChipPicSlave error: {0}
     SetIrqChipPicSlave(kvm_ioctls::Error),
-    /// {0}
+    /// Set IrqChipIoAPIC error: {0}
     SetIrqChipIoAPIC(kvm_ioctls::Error),
-    /// {0}
+    /// VM error: {0}
     VmError(VmError),
 }
 
@@ -241,7 +218,7 @@ impl Vm {
         self.set_kvm_memory_regions(guest_mem, track_dirty_pages)?;
         #[cfg(target_arch = "x86_64")]
         self.fd
-            .set_tss_address(crate::arch::x86_64::layout::KVM_TSS_ADDRESS as usize)
+            .set_tss_address(u64_to_usize(crate::arch::x86_64::layout::KVM_TSS_ADDRESS))
             .map_err(VmError::VmSetup)?;
 
         Ok(())
@@ -258,10 +235,10 @@ impl Vm {
         }
         guest_mem
             .iter()
-            .enumerate()
-            .try_for_each(|(index, region)| {
+            .zip(0u32..)
+            .try_for_each(|(region, slot)| {
                 let memory_region = kvm_userspace_memory_region {
-                    slot: index as u32,
+                    slot,
                     guest_phys_addr: region.start_addr().raw_value(),
                     memory_size: region.len(),
                     // It's safe to unwrap because the guest address is valid.
@@ -338,12 +315,11 @@ impl Vm {
 
 /// Structure holding an general specific VM state.
 #[cfg(target_arch = "aarch64")]
-#[derive(Debug, Default, Versionize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct VmState {
     /// GIC state.
     pub gic: GicState,
     /// Additional capabilities that were specified in cpu template.
-    #[version(start = 2, default_fn = "default_caps")]
     pub kvm_cap_modifiers: Vec<KvmCapability>,
 }
 
@@ -461,9 +437,8 @@ impl Vm {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[derive(Default, Versionize)]
+#[derive(Default, Deserialize, Serialize)]
 /// Structure holding VM kvm state.
-// NOTICE: Any changes to this structure require a snapshot version bump.
 pub struct VmState {
     pitstate: kvm_pit_state2,
     clock: kvm_clock_data,
@@ -474,14 +449,7 @@ pub struct VmState {
     ioapic: kvm_irqchip,
 
     /// Additional capabilities that were specified in cpu template.
-    #[version(start = 2, default_fn = "default_caps")]
     pub kvm_cap_modifiers: Vec<KvmCapability>,
-}
-
-impl VmState {
-    fn default_caps(_: u16) -> Vec<KvmCapability> {
-        Vec::default()
-    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -499,20 +467,18 @@ impl fmt::Debug for VmState {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use utils::vm_memory::GuestAddress;
-
     use super::*;
+    #[cfg(target_arch = "x86_64")]
+    use crate::snapshot::Snapshot;
+    use crate::test_utils::single_region_mem;
+    use crate::vstate::memory::GuestMemoryMmap;
 
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm(mem_size: usize) -> (Vm, GuestMemoryMmap) {
-        let gm = utils::vm_memory::test_utils::create_anon_guest_memory(
-            &[(GuestAddress(0), mem_size)],
-            false,
-        )
-        .unwrap();
+        let gm = single_region_mem(mem_size);
 
         let vm = Vm::new(vec![]).expect("Cannot create new vm");
-        assert!(vm.memory_init(&gm, false).is_ok());
+        vm.memory_init(&gm, false).unwrap();
 
         (vm, gm)
     }
@@ -520,7 +486,7 @@ pub(crate) mod tests {
     #[test]
     fn test_new() {
         // Testing with a valid /dev/kvm descriptor.
-        assert!(Vm::new(vec![]).is_ok());
+        Vm::new(vec![]).unwrap();
     }
 
     #[test]
@@ -546,12 +512,8 @@ pub(crate) mod tests {
         let vm = Vm::new(vec![]).expect("Cannot create new vm");
 
         // Create valid memory region and test that the initialization is successful.
-        let gm = utils::vm_memory::test_utils::create_anon_guest_memory(
-            &[(GuestAddress(0), 0x1000)],
-            false,
-        )
-        .unwrap();
-        assert!(vm.memory_init(&gm, true).is_ok());
+        let gm = single_region_mem(0x1000);
+        vm.memory_init(&gm, true).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -559,7 +521,7 @@ pub(crate) mod tests {
     fn test_vm_save_restore_state() {
         let vm = Vm::new(vec![]).expect("new vm failed");
         // Irqchips, clock and pitstate are not configured so trying to save state should fail.
-        assert!(vm.save_state().is_err());
+        vm.save_state().unwrap_err();
 
         let (vm, _mem) = setup_vm(0x1000);
         vm.setup_irqchip().unwrap();
@@ -577,7 +539,7 @@ pub(crate) mod tests {
         let (mut vm, _mem) = setup_vm(0x1000);
         vm.setup_irqchip().unwrap();
 
-        assert!(vm.restore_state(&vm_state).is_ok());
+        vm.restore_state(&vm_state).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -595,39 +557,45 @@ pub(crate) mod tests {
         // Try to restore an invalid PIC Master chip ID
         let orig_master_chip_id = vm_state.pic_master.chip_id;
         vm_state.pic_master.chip_id = KVM_NR_IRQCHIPS;
-        assert!(vm.restore_state(&vm_state).is_err());
+        vm.restore_state(&vm_state).unwrap_err();
         vm_state.pic_master.chip_id = orig_master_chip_id;
 
         // Try to restore an invalid PIC Slave chip ID
         let orig_slave_chip_id = vm_state.pic_slave.chip_id;
         vm_state.pic_slave.chip_id = KVM_NR_IRQCHIPS;
-        assert!(vm.restore_state(&vm_state).is_err());
+        vm.restore_state(&vm_state).unwrap_err();
         vm_state.pic_slave.chip_id = orig_slave_chip_id;
 
         // Try to restore an invalid IOPIC chip ID
         vm_state.ioapic.chip_id = KVM_NR_IRQCHIPS;
-        assert!(vm.restore_state(&vm_state).is_err());
+        vm.restore_state(&vm_state).unwrap_err();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vmstate_serde() {
+        let mut snapshot_data = vec![0u8; 10000];
+
+        let (mut vm, _) = setup_vm(0x1000);
+        vm.setup_irqchip().unwrap();
+        let state = vm.save_state().unwrap();
+        Snapshot::serialize(&mut snapshot_data.as_mut_slice(), &state).unwrap();
+        let restored_state: VmState = Snapshot::deserialize(&mut snapshot_data.as_slice()).unwrap();
+
+        vm.restore_state(&restored_state).unwrap();
     }
 
     #[test]
     fn test_set_kvm_memory_regions() {
         let vm = Vm::new(vec![]).expect("Cannot create new vm");
 
-        let gm = utils::vm_memory::test_utils::create_anon_guest_memory(
-            &[(GuestAddress(0), 0x1000)],
-            false,
-        )
-        .unwrap();
+        let gm = single_region_mem(0x1000);
         let res = vm.set_kvm_memory_regions(&gm, false);
-        assert!(res.is_ok());
+        res.unwrap();
 
-        // Trying to set a memory region with a size that is not a multiple of PAGE_SIZE
+        // Trying to set a memory region with a size that is not a multiple of GUEST_PAGE_SIZE
         // will result in error.
-        let gm = utils::vm_memory::test_utils::create_guest_memory_unguarded(
-            &[(GuestAddress(0), 0x10)],
-            false,
-        )
-        .unwrap();
+        let gm = single_region_mem(0x10);
         let res = vm.set_kvm_memory_regions(&gm, false);
         assert_eq!(
             res.unwrap_err().to_string(),

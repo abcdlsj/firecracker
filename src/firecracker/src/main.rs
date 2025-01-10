@@ -1,13 +1,16 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod api_server;
 mod api_server_adapter;
+mod gen;
 mod metrics;
 mod seccomp;
 
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::{io, panic};
 
@@ -15,19 +18,21 @@ use api_server_adapter::ApiServerError;
 use event_manager::SubscriberOps;
 use seccomp::FilterError;
 use seccompiler::BpfThreadMap;
-use snapshot::{Error as SnapshotError, Snapshot};
 use utils::arg_parser::{ArgParser, Argument};
-use utils::terminal::Terminal;
 use utils::validators::validate_instance_id;
+use vmm::arch::host_page_size;
 use vmm::builder::StartMicrovmError;
-use vmm::logger::{error, info, ProcessTimeReporter, StoreMetric, LOGGER, METRICS};
+use vmm::logger::{
+    debug, error, info, LoggerConfig, ProcessTimeReporter, StoreMetric, LOGGER, METRICS,
+};
+use vmm::persist::SNAPSHOT_VERSION;
 use vmm::resources::VmResources;
 use vmm::signal_handler::register_signal_handlers;
-use vmm::version_map::{FC_VERSION_TO_SNAP_VERSION, VERSION_MAP};
+use vmm::snapshot::{Snapshot, SnapshotError};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::vmm_config::logger_config::{init_logger, LoggerConfig, LoggerConfigError, LoggerLevel};
 use vmm::vmm_config::metrics::{init_metrics, MetricsConfig, MetricsConfigError};
 use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
+use vmm_sys_util::terminal::Terminal;
 
 use crate::seccomp::SeccompConfig;
 
@@ -35,23 +40,24 @@ use crate::seccomp::SeccompConfig;
 // runtime file.
 // see https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch03s15.html for more information.
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
-const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MMDS_CONTENT_ARG: &str = "metadata";
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 enum MainError {
+    /// Failed to set the logger: {0}
+    SetLogger(vmm::logger::LoggerInitError),
     /// Failed to register signal handlers: {0}
-    RegisterSignalHandlers(#[source] utils::errno::Error),
+    RegisterSignalHandlers(#[source] vmm_sys_util::errno::Error),
     /// Arguments parsing error: {0} \n\nFor more information try --help.
-    ParseArguments(#[from] utils::arg_parser::Error),
+    ParseArguments(#[from] utils::arg_parser::UtilsArgParserError),
     /// When printing Snapshot Data format: {0}
     PrintSnapshotDataFormat(#[from] SnapshotVersionError),
     /// Invalid value for logger level: {0}.Possible values: [Error, Warning, Info, Debug]
-    InvalidLogLevel(LoggerConfigError),
+    InvalidLogLevel(vmm::logger::LevelFilterFromStrError),
     /// Could not initialize logger: {0}
-    LoggerInitialization(LoggerConfigError),
-    /// Could not initialize metrics: {0:?}
+    LoggerInitialization(vmm::logger::LoggerUpdateError),
+    /// Could not initialize metrics: {0}
     MetricsInitialization(MetricsConfigError),
     /// Seccomp error: {0}
     SeccompFilter(FilterError),
@@ -73,17 +79,15 @@ enum ResizeFdTableError {
     Close(io::Error),
 }
 
-impl From<MainError> for ExitCode {
+impl From<MainError> for FcExitCode {
     fn from(value: MainError) -> Self {
-        let exit_code = match value {
+        match value {
             MainError::ParseArguments(_) => FcExitCode::ArgParsing,
             MainError::InvalidLogLevel(_) => FcExitCode::BadConfiguration,
-            MainError::RunWithApi(ApiServerError::MicroVMStoppedWithoutError(code)) => code,
             MainError::RunWithApi(ApiServerError::MicroVMStoppedWithError(code)) => code,
+            MainError::RunWithoutApiError(RunWithoutApiError::Shutdown(code)) => code,
             _ => FcExitCode::GenericError,
-        };
-
-        ExitCode::from(exit_code as u8)
+        }
     }
 }
 
@@ -92,34 +96,22 @@ fn main() -> ExitCode {
     if let Err(err) = result {
         error!("{err}");
         eprintln!("Error: {err:?}");
-        ExitCode::from(err)
+        let exit_code = FcExitCode::from(err) as u8;
+        error!("Firecracker exiting with error. exit_code={exit_code}");
+        ExitCode::from(exit_code)
     } else {
+        info!("Firecracker exiting successfully. exit_code=0");
         ExitCode::SUCCESS
     }
 }
 
 fn main_exec() -> Result<(), MainError> {
-    LOGGER
-        .configure(Some(DEFAULT_INSTANCE_ID.to_string()))
-        .expect("Failed to register logger");
+    // Initialize the logger.
+    LOGGER.init().map_err(MainError::SetLogger)?;
 
-    register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
-
-    #[cfg(target_arch = "aarch64")]
-    enable_ssbd_mitigation();
-
-    if let Err(err) = resize_fdtable() {
-        match err {
-            // These errors are non-critical: In the worst case we have worse snapshot restore
-            // performance.
-            ResizeFdTableError::GetRlimit | ResizeFdTableError::Dup2(_) => {
-                vmm::logger::debug!("Failed to resize fdtable: {err}")
-            }
-            // This error means that we now have a random file descriptor lying around, abort to be
-            // cautious.
-            ResizeFdTableError::Close(_) => return Err(MainError::ResizeFdtable(err)),
-        }
-    }
+    // First call to this function updates the value to current
+    // host page size.
+    _ = host_page_size();
 
     // We need this so that we can reset terminal to canonical mode if panic occurs.
     let stdin = io::stdin();
@@ -149,124 +141,126 @@ fn main_exec() -> Result<(), MainError> {
 
     let http_max_payload_size_str = HTTP_MAX_PAYLOAD_SIZE.to_string();
 
-    let mut arg_parser = ArgParser::new()
-        .arg(
-            Argument::new("api-sock")
-                .takes_value(true)
-                .default_value(DEFAULT_API_SOCK_PATH)
-                .help("Path to unix domain socket used by the API."),
-        )
-        .arg(
-            Argument::new("id")
-                .takes_value(true)
-                .default_value(DEFAULT_INSTANCE_ID)
-                .help("MicroVM unique identifier."),
-        )
-        .arg(
-            Argument::new("seccomp-filter")
-                .takes_value(true)
-                .forbids(vec!["no-seccomp"])
-                .help(
-                    "Optional parameter which allows specifying the path to a custom seccomp \
-                     filter. For advanced users.",
+    let mut arg_parser =
+        ArgParser::new()
+            .arg(
+                Argument::new("api-sock")
+                    .takes_value(true)
+                    .default_value(DEFAULT_API_SOCK_PATH)
+                    .help("Path to unix domain socket used by the API."),
+            )
+            .arg(
+                Argument::new("id")
+                    .takes_value(true)
+                    .default_value(vmm::logger::DEFAULT_INSTANCE_ID)
+                    .help("MicroVM unique identifier."),
+            )
+            .arg(
+                Argument::new("seccomp-filter")
+                    .takes_value(true)
+                    .forbids(vec!["no-seccomp"])
+                    .help(
+                        "Optional parameter which allows specifying the path to a custom seccomp \
+                         filter. For advanced users.",
+                    ),
+            )
+            .arg(
+                Argument::new("no-seccomp")
+                    .takes_value(false)
+                    .forbids(vec!["seccomp-filter"])
+                    .help(
+                        "Optional parameter which allows starting and using a microVM without \
+                         seccomp filtering. Not recommended.",
+                    ),
+            )
+            .arg(
+                Argument::new("start-time-us").takes_value(true).help(
+                    "Process start time (wall clock, microseconds). This parameter is optional.",
                 ),
-        )
-        .arg(
-            Argument::new("no-seccomp")
-                .takes_value(false)
-                .forbids(vec!["seccomp-filter"])
-                .help(
-                    "Optional parameter which allows starting and using a microVM without seccomp \
-                     filtering. Not recommended.",
-                ),
-        )
-        .arg(
-            Argument::new("start-time-us")
-                .takes_value(true)
-                .help("Process start time (wall clock, microseconds). This parameter is optional."),
-        )
-        .arg(
-            Argument::new("start-time-cpu-us").takes_value(true).help(
+            )
+            .arg(Argument::new("start-time-cpu-us").takes_value(true).help(
                 "Process start CPU time (wall clock, microseconds). This parameter is optional.",
-            ),
-        )
-        .arg(Argument::new("parent-cpu-time-us").takes_value(true).help(
-            "Parent process CPU time (wall clock, microseconds). This parameter is optional.",
-        ))
-        .arg(
-            Argument::new("config-file")
-                .takes_value(true)
-                .help("Path to a file that contains the microVM configuration in JSON format."),
-        )
-        .arg(
-            Argument::new(MMDS_CONTENT_ARG)
-                .takes_value(true)
-                .help("Path to a file that contains metadata in JSON format to add to the mmds."),
-        )
-        .arg(
-            Argument::new("no-api")
-                .takes_value(false)
-                .requires("config-file")
-                .help(
-                    "Optional parameter which allows starting and using a microVM without an \
-                     active API socket.",
+            ))
+            .arg(Argument::new("parent-cpu-time-us").takes_value(true).help(
+                "Parent process CPU time (wall clock, microseconds). This parameter is optional.",
+            ))
+            .arg(
+                Argument::new("config-file")
+                    .takes_value(true)
+                    .help("Path to a file that contains the microVM configuration in JSON format."),
+            )
+            .arg(
+                Argument::new(MMDS_CONTENT_ARG).takes_value(true).help(
+                    "Path to a file that contains metadata in JSON format to add to the mmds.",
                 ),
-        )
-        .arg(
-            Argument::new("log-path")
-                .takes_value(true)
-                .help("Path to a fifo or a file used for configuring the logger on startup."),
-        )
-        .arg(
-            Argument::new("level")
-                .takes_value(true)
-                .requires("log-path")
-                .default_value("Warning")
-                .help("Set the logger level."),
-        )
-        .arg(
-            Argument::new("show-level")
-                .takes_value(false)
-                .requires("log-path")
-                .help("Whether or not to output the level in the logs."),
-        )
-        .arg(
-            Argument::new("show-log-origin")
-                .takes_value(false)
-                .requires("log-path")
-                .help(
-                    "Whether or not to include the file path and line number of the log's origin.",
-                ),
-        )
-        .arg(
-            Argument::new("metrics-path")
-                .takes_value(true)
-                .help("Path to a fifo or a file used for configuring the metrics on startup."),
-        )
-        .arg(Argument::new("boot-timer").takes_value(false).help(
-            "Whether or not to load boot timer device for logging elapsed time since \
-             InstanceStart command.",
-        ))
-        .arg(Argument::new("version").takes_value(false).help(
-            "Print the binary version number and a list of supported snapshot data format \
-             versions.",
-        ))
-        .arg(
-            Argument::new("describe-snapshot")
-                .takes_value(true)
-                .help("Print the data format version of the provided snapshot state file."),
-        )
-        .arg(
-            Argument::new("http-api-max-payload-size")
-                .takes_value(true)
-                .default_value(&http_max_payload_size_str)
-                .help("Http API request payload max size, in bytes."),
-        )
-        .arg(
-            Argument::new("mmds-size-limit")
-                .takes_value(true)
-                .help("Mmds data store limit, in bytes."),
-        );
+            )
+            .arg(
+                Argument::new("no-api")
+                    .takes_value(false)
+                    .requires("config-file")
+                    .help(
+                        "Optional parameter which allows starting and using a microVM without an \
+                         active API socket.",
+                    ),
+            )
+            .arg(
+                Argument::new("log-path")
+                    .takes_value(true)
+                    .help("Path to a fifo or a file used for configuring the logger on startup."),
+            )
+            .arg(
+                Argument::new("level")
+                    .takes_value(true)
+                    .help("Set the logger level."),
+            )
+            .arg(
+                Argument::new("module")
+                    .takes_value(true)
+                    .help("Set the logger module filter."),
+            )
+            .arg(
+                Argument::new("show-level")
+                    .takes_value(false)
+                    .help("Whether or not to output the level in the logs."),
+            )
+            .arg(Argument::new("show-log-origin").takes_value(false).help(
+                "Whether or not to include the file path and line number of the log's origin.",
+            ))
+            .arg(
+                Argument::new("metrics-path")
+                    .takes_value(true)
+                    .help("Path to a fifo or a file used for configuring the metrics on startup."),
+            )
+            .arg(Argument::new("boot-timer").takes_value(false).help(
+                "Whether or not to load boot timer device for logging elapsed time since \
+                 InstanceStart command.",
+            ))
+            .arg(
+                Argument::new("version")
+                    .takes_value(false)
+                    .help("Print the binary version number."),
+            )
+            .arg(
+                Argument::new("snapshot-version")
+                    .takes_value(false)
+                    .help("Print the supported data format version."),
+            )
+            .arg(
+                Argument::new("describe-snapshot")
+                    .takes_value(true)
+                    .help("Print the data format version of the provided snapshot state file."),
+            )
+            .arg(
+                Argument::new("http-api-max-payload-size")
+                    .takes_value(true)
+                    .default_value(&http_max_payload_size_str)
+                    .help("Http API request payload max size, in bytes."),
+            )
+            .arg(
+                Argument::new("mmds-size-limit")
+                    .takes_value(true)
+                    .help("Mmds data store limit, in bytes."),
+            );
 
     arg_parser.parse_from_cmdline()?;
     let arguments = arg_parser.arguments();
@@ -279,7 +273,11 @@ fn main_exec() -> Result<(), MainError> {
 
     if arguments.flag_present("version") {
         println!("Firecracker v{}\n", FIRECRACKER_VERSION);
-        print_supported_snapshot_versions();
+        return Ok(());
+    }
+
+    if arguments.flag_present("snapshot-version") {
+        println!("v{SNAPSHOT_VERSION}");
         return Ok(());
     }
 
@@ -288,14 +286,56 @@ fn main_exec() -> Result<(), MainError> {
         return Ok(());
     }
 
+    // It's safe to unwrap here because the field's been provided with a default value.
+    let instance_id = arguments.single_value("id").unwrap();
+    validate_instance_id(instance_id.as_str()).expect("Invalid instance ID");
+
+    // Apply the logger configuration.
+    vmm::logger::INSTANCE_ID
+        .set(String::from(instance_id))
+        .unwrap();
+    let log_path = arguments.single_value("log-path").map(PathBuf::from);
+    let level = arguments
+        .single_value("level")
+        .map(|s| vmm::logger::LevelFilter::from_str(s))
+        .transpose()
+        .map_err(MainError::InvalidLogLevel)?;
+    let show_level = arguments.flag_present("show-level").then_some(true);
+    let show_log_origin = arguments.flag_present("show-log-origin").then_some(true);
+    let module = arguments.single_value("module").cloned();
+    LOGGER
+        .update(LoggerConfig {
+            log_path,
+            level,
+            show_level,
+            show_log_origin,
+            module,
+        })
+        .map_err(MainError::LoggerInitialization)?;
+    info!("Running Firecracker v{FIRECRACKER_VERSION}");
+
+    register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
+
+    #[cfg(target_arch = "aarch64")]
+    enable_ssbd_mitigation();
+
+    if let Err(err) = resize_fdtable() {
+        match err {
+            // These errors are non-critical: In the worst case we have worse snapshot restore
+            // performance.
+            ResizeFdTableError::GetRlimit | ResizeFdTableError::Dup2(_) => {
+                debug!("Failed to resize fdtable: {err}")
+            }
+            // This error means that we now have a random file descriptor lying around, abort to be
+            // cautious.
+            ResizeFdTableError::Close(_) => return Err(MainError::ResizeFdtable(err)),
+        }
+    }
+
     // Display warnings for any used deprecated parameters.
     // Currently unused since there are no deprecated parameters. Uncomment the line when
     // deprecating one.
     // warn_deprecated_parameters(&arguments);
-
-    // It's safe to unwrap here because the field's been provided with a default value.
-    let instance_id = arguments.single_value("id").unwrap();
-    validate_instance_id(instance_id.as_str()).expect("Invalid instance ID");
 
     let instance_info = InstanceInfo {
         id: instance_id.clone(),
@@ -303,24 +343,6 @@ fn main_exec() -> Result<(), MainError> {
         vmm_version: FIRECRACKER_VERSION.to_string(),
         app_name: "Firecracker".to_string(),
     };
-
-    LOGGER.set_instance_id(instance_id.to_owned());
-
-    if let Some(log) = arguments.single_value("log-path") {
-        // It's safe to unwrap here because the field's been provided with a default value.
-        let level = arguments.single_value("level").unwrap().to_owned();
-        let logger_level = LoggerLevel::from_string(level).map_err(MainError::InvalidLogLevel)?;
-        let show_level = arguments.flag_present("show-level");
-        let show_log_origin = arguments.flag_present("show-log-origin");
-
-        let logger_config = LoggerConfig {
-            log_path: PathBuf::from(log),
-            level: logger_level,
-            show_level,
-            show_log_origin,
-        };
-        init_logger(logger_config, &instance_info).map_err(MainError::LoggerInitialization)?;
-    }
 
     if let Some(metrics_path) = arguments.single_value("metrics-path") {
         let metrics_config = MetricsConfig {
@@ -473,22 +495,15 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
 /// Enable SSBD mitigation through `prctl`.
 #[cfg(target_arch = "aarch64")]
 pub fn enable_ssbd_mitigation() {
-    // Parameters for `prctl`
-    // TODO: generate bindings for these from the kernel sources.
-    // https://elixir.bootlin.com/linux/v4.17/source/include/uapi/linux/prctl.h#L212
-    const PR_SET_SPECULATION_CTRL: i32 = 53;
-    const PR_SPEC_STORE_BYPASS: u64 = 0;
-    const PR_SPEC_FORCE_DISABLE: u64 = 1u64 << 3;
-
     // SAFETY: Parameters are valid since they are copied verbatim
     // from the kernel's UAPI.
     // PR_SET_SPECULATION_CTRL only uses those 2 parameters, so it's ok
     // to leave the latter 2 as zero.
     let ret = unsafe {
         libc::prctl(
-            PR_SET_SPECULATION_CTRL,
-            PR_SPEC_STORE_BYPASS,
-            PR_SPEC_FORCE_DISABLE,
+            gen::prctl::PR_SET_SPECULATION_CTRL,
+            gen::prctl::PR_SPEC_STORE_BYPASS,
+            gen::prctl::PR_SPEC_FORCE_DISABLE,
             0,
             0,
         )
@@ -510,28 +525,12 @@ pub fn enable_ssbd_mitigation() {
 #[allow(unused)]
 fn warn_deprecated_parameters() {}
 
-// Print supported snapshot data format versions.
-fn print_supported_snapshot_versions() {
-    let mut versions: Vec<_> = FC_VERSION_TO_SNAP_VERSION
-        .iter()
-        .map(|(key, _)| key.clone())
-        .collect();
-    versions.sort();
-
-    println!("Supported snapshot data format versions:");
-    for v in versions.iter() {
-        println!("{v}");
-    }
-}
-
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 enum SnapshotVersionError {
     /// Unable to open snapshot state file: {0}
     OpenSnapshot(io::Error),
     /// Invalid data format version of snapshot file: {0}
     SnapshotVersion(SnapshotError),
-    /// Cannot translate snapshot data version {0} to Firecracker microVM version
-    FirecrackerVersion(u16),
 }
 
 // Print data format of provided snapshot state file.
@@ -539,15 +538,10 @@ fn print_snapshot_data_format(snapshot_path: &str) -> Result<(), SnapshotVersion
     let mut snapshot_reader =
         File::open(snapshot_path).map_err(SnapshotVersionError::OpenSnapshot)?;
 
-    let data_format_version = Snapshot::get_data_version(&mut snapshot_reader, &VERSION_MAP)
+    let data_format_version = Snapshot::get_format_version(&mut snapshot_reader)
         .map_err(SnapshotVersionError::SnapshotVersion)?;
 
-    let (key, _) = FC_VERSION_TO_SNAP_VERSION
-        .iter()
-        .find(|(_, &val)| val == data_format_version)
-        .ok_or_else(|| SnapshotVersionError::FirecrackerVersion(data_format_version))?;
-
-    println!("v{}", key);
+    println!("v{}", data_format_version);
     Ok(())
 }
 
@@ -633,8 +627,11 @@ fn run_without_api(
             .run()
             .expect("Failed to start the event manager");
 
-        if let Some(exit_code) = vmm.lock().unwrap().shutdown_exit_code() {
-            return Err(RunWithoutApiError::Shutdown(exit_code));
+        match vmm.lock().unwrap().shutdown_exit_code() {
+            Some(FcExitCode::Ok) => break,
+            Some(exit_code) => return Err(RunWithoutApiError::Shutdown(exit_code)),
+            None => continue,
         }
     }
+    Ok(())
 }

@@ -7,6 +7,7 @@
 //! virtio queue:
 //! - the packet header; and
 //! - the packet data/buffer.
+//!
 //! There is a 1:1 relation between descriptor chains and packets: the first (chain head) holds
 //! the header, and an optional second descriptor holds the data. The second descriptor is only
 //! present for data packets (VSOCK_OP_RW).
@@ -16,15 +17,14 @@
 //! to temporary buffers, before passing it on to the vsock backend.
 
 use std::fmt::Debug;
-use std::io::ErrorKind;
 
-use utils::vm_memory::{
-    Address, AtomicBitmap, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError,
-    GuestMemoryMmap, ReadVolatile, VolatileMemoryError, VolatileSlice, WriteVolatile, BS,
-};
+use vm_memory::volatile_memory::Error;
+use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
 
-use super::super::DescriptorChain;
 use super::{defs, VsockError};
+use crate::devices::virtio::iovec::{IoVecBuffer, IoVecBufferMut};
+use crate::devices::virtio::queue::DescriptorChain;
+use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 
 // The vsock packet header is defined by the C struct:
 //
@@ -78,328 +78,76 @@ pub struct VsockPacketHeader {
     fwd_cnt: u32,
 }
 
-/// The vsock packet header struct size (the struct is packed).
-pub const VSOCK_PKT_HDR_SIZE: usize = 44;
-
-// SAFETY: `VsockPacketHeader` is a POD and contains no padding.
-unsafe impl ByteValued for VsockPacketHeader {}
-
-/// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
-/// - the chain head, holding the packet header; and
-/// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
-#[derive(Debug)]
-pub struct VsockPacket {
-    hdr_addr: GuestAddress,
-    // For performance purposes we hold a local copy of the Packet header.
-    // This reduces the number of calls to `vm-memory` to a minimum:
-    // 1 write for Rx and 1 read for Tx, plus 1 `check_range` call for each.
-    hdr: VsockPacketHeader,
-    buf_addr: Option<GuestAddress>,
-    buf_size: usize,
-}
-
-impl VsockPacket {
-    fn check_desc_write_only(
-        desc: &DescriptorChain,
-        expected_write_only: bool,
-    ) -> Result<(), VsockError> {
-        if desc.is_write_only() != expected_write_only {
-            return match desc.is_write_only() {
-                true => Err(VsockError::UnreadableDescriptor),
-                false => Err(VsockError::UnwritableDescriptor),
-            };
-        }
-
-        Ok(())
-    }
-
-    fn check_hdr_desc(
-        hdr_desc: &DescriptorChain,
-        expected_write_only: bool,
-    ) -> Result<(), VsockError> {
-        Self::check_desc_write_only(hdr_desc, expected_write_only)?;
-
-        // Validate the packet header address
-        if !hdr_desc.mem.check_range(hdr_desc.addr, VSOCK_PKT_HDR_SIZE) {
-            return Err(VsockError::GuestMemoryBounds);
-        }
-
-        // The packet header should fit inside the head descriptor.
-        if hdr_desc.len < VSOCK_PKT_HDR_SIZE as u32 {
-            return Err(VsockError::HdrDescTooSmall(hdr_desc.len));
-        }
-
-        Ok(())
-    }
-
-    fn init_buf(
-        &mut self,
-        hdr_desc: &DescriptorChain,
-        expected_write_only: bool,
-    ) -> Result<(), VsockError> {
-        let buf_desc = hdr_desc
-            .next_descriptor()
-            .ok_or(VsockError::BufDescMissing)?;
-        let buf_size = buf_desc.len as usize;
-
-        Self::check_desc_write_only(&buf_desc, expected_write_only)?;
-
-        // Validate the packet buf address
-        if !buf_desc
-            .mem
-            .check_range(buf_desc.addr, buf_desc.len as usize)
-        {
-            return Err(VsockError::GuestMemoryBounds);
-        }
-
-        self.buf_addr = Some(buf_desc.addr);
-        self.buf_size = buf_size;
-
-        Ok(())
-    }
-
-    /// Create the packet wrapper from a TX virtq chain head.
-    ///
-    /// The chain head is expected to hold valid packet header data. A following packet buffer
-    /// descriptor can optionally end the chain. Bounds and pointer checks are performed when
-    /// creating the wrapper.
-    pub fn from_tx_virtq_head(hdr_desc: &DescriptorChain) -> Result<Self, VsockError> {
-        Self::check_hdr_desc(hdr_desc, false)?;
-
-        // Validate the packet header address
-        if !hdr_desc.mem.check_range(hdr_desc.addr, VSOCK_PKT_HDR_SIZE) {
-            return Err(VsockError::GuestMemoryBounds);
-        }
-
-        let mut pkt = Self {
-            hdr_addr: hdr_desc.addr,
-            // On the Tx path the header is provided by the guest and is read only for Firecracker.
-            // So we read it here once and we work with the local copy from now on.
-            hdr: hdr_desc
-                .mem
-                .read_obj(hdr_desc.addr)
-                .map_err(VsockError::GuestMemoryMmap)?,
-            buf_addr: None,
-            buf_size: 0,
-        };
-
-        // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
-        if pkt.len() == 0 {
-            return Ok(pkt);
-        }
-
-        // Reject weirdly-sized packets.
-        pkt.check_len()?;
-
-        pkt.init_buf(hdr_desc, false)?;
-
-        // The data buffer should be large enough to fit the size of the data, as described by
-        // the header descriptor.
-        if pkt.buf_size < pkt.len() as usize {
-            return Err(VsockError::BufDescTooSmall);
-        }
-
-        Ok(pkt)
-    }
-
-    /// Create the packet wrapper from an RX virtq chain head.
-    ///
-    /// There must be two descriptors in the chain, both writable: a header descriptor and a data
-    /// descriptor. Bounds and pointer checks are performed when creating the wrapper.
-    pub fn from_rx_virtq_head(hdr_desc: &DescriptorChain) -> Result<Self, VsockError> {
-        Self::check_hdr_desc(hdr_desc, true)?;
-
-        let mut pkt = Self {
-            hdr_addr: hdr_desc.addr,
-            // On the Rx path the header has to be filled by Firecracker. The guest only provides
-            // a write-only memory area that Firecracker can write the header into. So we initialize
-            // the local copy with zeros, we write to it whenever we need to, and we only commit it
-            // to the guest memory once, before marking the RX descriptor chain as used.
-            hdr: VsockPacketHeader::default(),
-            buf_addr: None,
-            buf_size: 0,
-        };
-
-        pkt.init_buf(hdr_desc, true)?;
-
-        Ok(pkt)
-    }
-
-    /// Provides in-place access to the local copy of the vsock packet header.
-    pub fn hdr(&self) -> &VsockPacketHeader {
-        &self.hdr
-    }
-
-    /// Writes the local copy of the packet header to the guest memory.
-    pub fn commit_hdr(&self, mem: &GuestMemoryMmap) -> Result<(), VsockError> {
-        // Reject weirdly-sized packets.
-        self.check_len()?;
-
-        mem.write_obj(self.hdr, self.hdr_addr)
-            .map_err(VsockError::GuestMemoryMmap)
-    }
-
-    /// Verifies packet length against `MAX_PKT_BUF_SIZE` limit.
-    pub fn check_len(&self) -> Result<(), VsockError> {
-        if self.len() > defs::MAX_PKT_BUF_SIZE as u32 {
-            return Err(VsockError::InvalidPktLen(self.len()));
-        }
-
-        Ok(())
-    }
-
-    pub fn buf_size(&self) -> usize {
-        self.buf_size
-    }
-
-    /// Verifies that it is legal to write `count` bytes into the data descriptor of this
-    /// [`VsockPacket`] at offset `buf_offset`.
-    ///
-    /// Returns a [`VolatileSlice`͘] of length `count` starting at offset `buf_offset` to the
-    /// [`GuestMemoryMmap`] backing the data descriptor of this [`VsockPacket`].
-    fn check_bounds_for_buffer_access<'a>(
-        &'a self,
-        mem: &'a GuestMemoryMmap,
-        buf_offset: usize,
-        count: usize,
-    ) -> Result<VolatileSlice<'a, BS<Option<AtomicBitmap>>>, VsockError> {
-        // Check that the desired slice is inside the buf.
-        self.buf_size
-            .checked_sub(buf_offset)
-            .and_then(|remaining_size| remaining_size.checked_sub(count))
-            .ok_or(VsockError::GuestMemoryBounds)?;
-
-        let buf_addr = self.buf_addr.ok_or(VsockError::PktBufMissing)?;
-
-        buf_addr
-            .checked_add(buf_offset as u64)
-            .and_then(|offset_addr| mem.get_slice(offset_addr, count).ok())
-            .and_then(|slice| {
-                // This rejects the scenario where buf_offset == buf_size and count == 0, which
-                // vm-memory would consider a valid subslice.
-                let _ = slice.offset(count.checked_sub(1)?).ok()?;
-                Some(slice)
-            })
-            .ok_or(VsockError::GuestMemoryBounds)
-    }
-
-    pub fn read_at_offset_from<T: ReadVolatile + Debug>(
-        &mut self,
-        mem: &GuestMemoryMmap,
-        offset: usize,
-        src: &mut T,
-        count: usize,
-    ) -> Result<usize, VsockError> {
-        let mut dst = self.check_bounds_for_buffer_access(mem, offset, count)?;
-
-        loop {
-            match src.read_volatile(&mut dst) {
-                Err(VolatileMemoryError::IOError(err)) if err.kind() == ErrorKind::Interrupted => {
-                    continue
-                }
-                Ok(bytes_read) => return Ok(bytes_read),
-                Err(volatile_memory_error) => {
-                    return Err(VsockError::GuestMemoryMmap(GuestMemoryError::from(
-                        volatile_memory_error,
-                    )))
-                }
-            }
-        }
-    }
-
-    pub fn write_from_offset_to<T: WriteVolatile + Debug>(
-        &self,
-        mem: &GuestMemoryMmap,
-        offset: usize,
-        dst: &mut T,
-        count: usize,
-    ) -> Result<usize, VsockError> {
-        let src = self.check_bounds_for_buffer_access(mem, offset, count)?;
-
-        loop {
-            match dst.write_volatile(&src) {
-                Err(VolatileMemoryError::IOError(err)) if err.kind() == ErrorKind::Interrupted => {
-                    continue
-                }
-                Ok(bytes_written) => return Ok(bytes_written),
-                Err(volatile_memory_error) => {
-                    return Err(VsockError::GuestMemoryMmap(GuestMemoryError::from(
-                        volatile_memory_error,
-                    )))
-                }
-            }
-        }
-    }
-
+impl VsockPacketHeader {
     pub fn src_cid(&self) -> u64 {
-        u64::from_le(self.hdr.src_cid)
+        u64::from_le(self.src_cid)
     }
 
     pub fn set_src_cid(&mut self, cid: u64) -> &mut Self {
-        self.hdr.src_cid = cid.to_le();
+        self.src_cid = cid.to_le();
         self
     }
 
     pub fn dst_cid(&self) -> u64 {
-        u64::from_le(self.hdr.dst_cid)
+        u64::from_le(self.dst_cid)
     }
 
     pub fn set_dst_cid(&mut self, cid: u64) -> &mut Self {
-        self.hdr.dst_cid = cid.to_le();
+        self.dst_cid = cid.to_le();
         self
     }
 
     pub fn src_port(&self) -> u32 {
-        u32::from_le(self.hdr.src_port)
+        u32::from_le(self.src_port)
     }
 
     pub fn set_src_port(&mut self, port: u32) -> &mut Self {
-        self.hdr.src_port = port.to_le();
+        self.src_port = port.to_le();
         self
     }
 
     pub fn dst_port(&self) -> u32 {
-        u32::from_le(self.hdr.dst_port)
+        u32::from_le(self.dst_port)
     }
 
     pub fn set_dst_port(&mut self, port: u32) -> &mut Self {
-        self.hdr.dst_port = port.to_le();
+        self.dst_port = port.to_le();
         self
     }
 
     pub fn len(&self) -> u32 {
-        u32::from_le(self.hdr.len)
+        u32::from_le(self.len)
     }
 
     pub fn set_len(&mut self, len: u32) -> &mut Self {
-        self.hdr.len = len.to_le();
+        self.len = len.to_le();
         self
     }
 
     pub fn type_(&self) -> u16 {
-        u16::from_le(self.hdr.type_)
+        u16::from_le(self.type_)
     }
 
     pub fn set_type(&mut self, type_: u16) -> &mut Self {
-        self.hdr.type_ = type_.to_le();
+        self.type_ = type_.to_le();
         self
     }
 
     pub fn op(&self) -> u16 {
-        u16::from_le(self.hdr.op)
+        u16::from_le(self.op)
     }
 
     pub fn set_op(&mut self, op: u16) -> &mut Self {
-        self.hdr.op = op.to_le();
+        self.op = op.to_le();
         self
     }
 
     pub fn flags(&self) -> u32 {
-        u32::from_le(self.hdr.flags)
+        u32::from_le(self.flags)
     }
 
     pub fn set_flags(&mut self, flags: u32) -> &mut Self {
-        self.hdr.flags = flags.to_le();
+        self.flags = flags.to_le();
         self
     }
 
@@ -409,61 +157,238 @@ impl VsockPacket {
     }
 
     pub fn buf_alloc(&self) -> u32 {
-        u32::from_le(self.hdr.buf_alloc)
+        u32::from_le(self.buf_alloc)
     }
 
     pub fn set_buf_alloc(&mut self, buf_alloc: u32) -> &mut Self {
-        self.hdr.buf_alloc = buf_alloc.to_le();
+        self.buf_alloc = buf_alloc.to_le();
         self
     }
 
     pub fn fwd_cnt(&self) -> u32 {
-        u32::from_le(self.hdr.fwd_cnt)
+        u32::from_le(self.fwd_cnt)
     }
 
     pub fn set_fwd_cnt(&mut self, fwd_cnt: u32) -> &mut Self {
-        self.hdr.fwd_cnt = fwd_cnt.to_le();
+        self.fwd_cnt = fwd_cnt.to_le();
         self
+    }
+}
+
+/// The vsock packet header struct size (the struct is packed).
+pub const VSOCK_PKT_HDR_SIZE: u32 = 44;
+
+// SAFETY: `VsockPacketHeader` is a POD and contains no padding.
+unsafe impl ByteValued for VsockPacketHeader {}
+
+// /// Struct describing a single vsock packet.
+// ///
+// /// Encapsulates the virtio descriptor chain containing the packet through the `IoVecBuffer[Mut]`
+// /// abstractions.
+#[derive(Debug, Default)]
+pub struct VsockPacketTx {
+    /// A copy of the vsock packet's 44-byte header, held in hypervisor memory
+    /// to minimize the number of accesses to guest memory. Can be written back
+    /// to geust memory using [`VsockPacket::commit_hdr`] (only for RX buffers).
+    pub hdr: VsockPacketHeader,
+    /// The raw buffer, as it is contained in guest memory (containing both
+    /// header and payload)
+    buffer: IoVecBuffer,
+}
+
+impl VsockPacketTx {
+    /// Create the packet wrapper from a TX virtq chain head.
+    ///
+    /// ## Errors
+    /// Returns
+    /// - [`VsockError::UnreadableDescriptor`] if the provided descriptor chain contains any
+    ///   descriptor not marked as writable.
+    /// - [`VsockError::DescChainTooShortForHeader`] if the descriptor chain's total buffer length
+    ///   is insufficient to hold the 44 byte vsock header
+    /// - [`VsockError::InvalidPktLen`] if the contained vsock header describes a vsock packet whose
+    ///   length would exceed [`defs::MAX_PKT_BUR_SIZE`].
+    /// - [`VsockError::DescChainTooShortForPacket`] if the contained vsock header describes a vsock
+    ///   packet whose length exceeds the descriptor chain's actual total buffer length.
+    pub fn parse(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        chain: DescriptorChain,
+    ) -> Result<(), VsockError> {
+        // SAFETY: This descriptor chain is only loaded once
+        // virtio requests are handled sequentially so no two IoVecBuffers
+        // are live at the same time, meaning this has exclusive ownership over the memory
+        unsafe { self.buffer.load_descriptor_chain(mem, chain)? };
+
+        let mut hdr = VsockPacketHeader::default();
+        match self.buffer.read_exact_volatile_at(hdr.as_mut_slice(), 0) {
+            Ok(()) => (),
+            Err(Error::PartialBuffer { completed, .. }) => {
+                return Err(VsockError::DescChainTooShortForHeader(completed))
+            }
+            Err(err) => return Err(VsockError::GuestMemoryMmap(err.into())),
+        }
+
+        if hdr.len > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(hdr.len));
+        }
+
+        if hdr.len > self.buffer.len() - VSOCK_PKT_HDR_SIZE {
+            return Err(VsockError::DescChainTooShortForPacket(
+                self.buffer.len(),
+                hdr.len,
+            ));
+        }
+        self.hdr = hdr;
+        Ok(())
+    }
+
+    pub fn write_from_offset_to<T: WriteVolatile + Debug>(
+        &self,
+        dst: &mut T,
+        offset: u32,
+        count: u32,
+    ) -> Result<u32, VsockError> {
+        if count
+            > self
+                .buffer
+                .len()
+                .saturating_sub(VSOCK_PKT_HDR_SIZE)
+                .saturating_sub(offset)
+        {
+            return Err(VsockError::GuestMemoryBounds);
+        }
+
+        self.buffer
+            .read_volatile_at(dst, (offset + VSOCK_PKT_HDR_SIZE) as usize, count as usize)
+            .map_err(|err| VsockError::GuestMemoryMmap(GuestMemoryError::from(err)))
+            .and_then(|read| read.try_into().map_err(|_| VsockError::DescChainOverflow))
+    }
+
+    /// Returns the total length of this [`VsockPacket`]'s buffer (e.g. the amount of data bytes
+    /// contained in this packet).
+    ///
+    /// Return value will equal the total length of the underlying descriptor chain's buffers,
+    /// minus the length of the vsock header.
+    pub fn buf_size(&self) -> u32 {
+        self.buffer.len() - VSOCK_PKT_HDR_SIZE
+    }
+}
+
+/// Struct describing a single vsock packet.
+///
+/// Encapsulates the virtio descriptor chain containing the packet through the `IoVecBuffer[Mut]`
+/// abstractions.
+#[derive(Debug)]
+pub struct VsockPacketRx {
+    /// A copy of the vsock packet's 44-byte header, held in hypervisor memory
+    /// to minimize the number of accesses to guest memory. Can be written back
+    /// to geust memory using [`VsockPacket::commit_hdr`] (only for RX buffers).
+    pub hdr: VsockPacketHeader,
+    /// The raw buffer, as it is contained in guest memory (containing both
+    /// header and payload)
+    buffer: IoVecBufferMut,
+}
+
+impl VsockPacketRx {
+    /// Creates new VsockPacketRx.
+    pub fn new() -> Result<Self, VsockError> {
+        let buffer = IoVecBufferMut::new().map_err(VsockError::IovDeque)?;
+        Ok(Self {
+            hdr: Default::default(),
+            buffer,
+        })
+    }
+
+    /// Create the packet wrapper from an RX virtq chain head.
+    ///
+    /// ## Errors
+    /// Returns [`VsockError::DescChainTooShortForHeader`] if the descriptor chain's total buffer
+    /// length is insufficient to hold the 44 byte vsock header
+    pub fn parse(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        chain: DescriptorChain,
+    ) -> Result<(), VsockError> {
+        // SAFETY: This descriptor chain is only loaded once
+        // virtio requests are handled sequentially so no two IoVecBuffers
+        // are live at the same time, meaning this has exclusive ownership over the memory
+        unsafe { self.buffer.load_descriptor_chain(mem, chain)? };
+        if self.buffer.len() < VSOCK_PKT_HDR_SIZE {
+            return Err(VsockError::DescChainTooShortForHeader(
+                self.buffer.len() as usize
+            ));
+        }
+        self.hdr = VsockPacketHeader::default();
+        Ok(())
+    }
+
+    /// Writes the local copy of the packet header to the guest memory.
+    ///
+    /// ## Errors
+    /// The function returns [`VsockError::UnwritableDescriptor`] if this [`VsockPacket`]
+    /// contains a guest-to-host (TX) packet. It returned [`VsockError::InvalidPktLen`] if the
+    /// packet's payload as described by this [`VsockPacket`] would exceed
+    /// [`defs::MAX_PKT_BUF_SIZE`].
+    pub fn commit_hdr(&mut self) -> Result<(), VsockError> {
+        if self.hdr.len > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(self.hdr.len));
+        }
+        self.buffer
+            .write_all_volatile_at(self.hdr.as_slice(), 0)
+            .map_err(GuestMemoryError::from)
+            .map_err(VsockError::GuestMemoryMmap)
+    }
+
+    /// Returns the total length of this [`VsockPacket`]'s buffer (e.g. the amount of data bytes
+    /// contained in this packet).
+    ///
+    /// Return value will equal the total length of the underlying descriptor chain's buffers,
+    /// minus the length of the vsock header.
+    pub fn buf_size(&self) -> u32 {
+        self.buffer.len() - VSOCK_PKT_HDR_SIZE
+    }
+
+    pub fn read_at_offset_from<T: ReadVolatile + Debug>(
+        &mut self,
+        src: &mut T,
+        offset: u32,
+        count: u32,
+    ) -> Result<u32, VsockError> {
+        if count
+            > self
+                .buffer
+                .len()
+                .saturating_sub(VSOCK_PKT_HDR_SIZE)
+                .saturating_sub(offset)
+        {
+            return Err(VsockError::GuestMemoryBounds);
+        }
+
+        self.buffer
+            .write_volatile_at(src, (offset + VSOCK_PKT_HDR_SIZE) as usize, count as usize)
+            .map_err(|err| VsockError::GuestMemoryMmap(GuestMemoryError::from(err)))
+            .and_then(|read| read.try_into().map_err(|_| VsockError::DescChainOverflow))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use utils::vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vm_memory::Bytes;
 
     use super::*;
+    use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::test_utils::VirtqDesc as GuestQDesc;
     use crate::devices::virtio::vsock::defs::MAX_PKT_BUF_SIZE;
     use crate::devices::virtio::vsock::device::{RXQ_INDEX, TXQ_INDEX};
     use crate::devices::virtio::vsock::test_utils::TestContext;
-    use crate::devices::virtio::VIRTQ_DESC_F_WRITE;
+    use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
     macro_rules! create_context {
         ($test_ctx:ident, $handler_ctx:ident) => {
             let $test_ctx = TestContext::new();
             let mut $handler_ctx = $test_ctx.create_event_handler_context();
             // For TX packets, hdr.len should be set to a valid value.
-            set_pkt_len(1024, &$handler_ctx.guest_txvq.dtable[0], &$test_ctx.mem);
-        };
-    }
-
-    macro_rules! expect_asm_error {
-        (tx, $test_ctx:expr, $handler_ctx:expr, $err:pat) => {
-            expect_asm_error!($test_ctx, $handler_ctx, $err, from_tx_virtq_head, TXQ_INDEX);
-        };
-        (rx, $test_ctx:expr, $handler_ctx:expr, $err:pat) => {
-            expect_asm_error!($test_ctx, $handler_ctx, $err, from_rx_virtq_head, RXQ_INDEX);
-        };
-        ($test_ctx:expr, $handler_ctx:expr, $err:pat, $ctor:ident, $vq_index:ident) => {
-            match VsockPacket::$ctor(
-                &$handler_ctx.device.queues[$vq_index]
-                    .pop(&$test_ctx.mem)
-                    .unwrap(),
-            ) {
-                Err($err) => (),
-                Ok(_) => panic!("Packet assembly should've failed!"),
-                Err(other) => panic!("Packet assembly failed with: {:?}", other),
-            }
+            set_pkt_len(4096, &$handler_ctx.guest_txvq.dtable[0], &$test_ctx.mem);
         };
     }
 
@@ -476,29 +401,29 @@ mod tests {
 
     #[test]
     fn test_packet_hdr_size() {
-        assert_eq!(VSOCK_PKT_HDR_SIZE, std::mem::size_of::<VsockPacketHeader>());
+        assert_eq!(
+            VSOCK_PKT_HDR_SIZE as usize,
+            std::mem::size_of::<VsockPacketHeader>(),
+        );
     }
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_tx_packet_assembly() {
-        // Test case: successful TX packet assembly.
+        // Test case: successful TX packet assembly as linux < 6.1 would build them.
         {
             create_context!(test_ctx, handler_ctx);
 
-            let pkt = VsockPacket::from_tx_virtq_head(
-                &handler_ctx.device.queues[TXQ_INDEX]
-                    .pop(&test_ctx.mem)
-                    .unwrap(),
+            let mut pkt = VsockPacketTx::default();
+            pkt.parse(
+                &test_ctx.mem,
+                handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
             )
             .unwrap();
+
             assert_eq!(
-                pkt.buf_size(),
-                handler_ctx.guest_txvq.dtable[1].len.get() as usize
-            );
-            assert_eq!(
-                pkt.buf_addr.unwrap().0,
-                handler_ctx.guest_txvq.dtable[1].addr.get()
+                TryInto::<u32>::try_into(pkt.buf_size()).unwrap(),
+                handler_ctx.guest_txvq.dtable[1].len.get()
             );
         }
 
@@ -508,7 +433,13 @@ mod tests {
             handler_ctx.guest_txvq.dtable[0]
                 .flags
                 .set(VIRTQ_DESC_F_WRITE);
-            expect_asm_error!(tx, test_ctx, handler_ctx, VsockError::UnreadableDescriptor);
+            assert!(matches!(
+                VsockPacketTx::default().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::UnreadableDescriptor)
+            ))
         }
 
         // Test case: header descriptor has insufficient space to hold the packet header.
@@ -516,32 +447,44 @@ mod tests {
             create_context!(test_ctx, handler_ctx);
             handler_ctx.guest_txvq.dtable[0]
                 .len
-                .set(VSOCK_PKT_HDR_SIZE as u32 - 1);
-            expect_asm_error!(tx, test_ctx, handler_ctx, VsockError::HdrDescTooSmall(_));
+                .set(VSOCK_PKT_HDR_SIZE - 1);
+            handler_ctx.guest_txvq.dtable[1].len.set(0);
+            assert!(matches!(
+                VsockPacketTx::default().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::DescChainTooShortForHeader(_))
+            ))
         }
 
         // Test case: zero-length TX packet.
         {
             create_context!(test_ctx, handler_ctx);
             set_pkt_len(0, &handler_ctx.guest_txvq.dtable[0], &test_ctx.mem);
-            let pkt = VsockPacket::from_tx_virtq_head(
-                &handler_ctx.device.queues[TXQ_INDEX]
-                    .pop(&test_ctx.mem)
-                    .unwrap(),
-            )
-            .unwrap();
-            assert!(pkt.buf_addr.is_none());
+            VsockPacketTx::default()
+                .parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
+                )
+                .unwrap();
         }
 
         // Test case: TX packet has more data than we can handle.
         {
             create_context!(test_ctx, handler_ctx);
             set_pkt_len(
-                MAX_PKT_BUF_SIZE as u32 + 1,
+                MAX_PKT_BUF_SIZE + 1,
                 &handler_ctx.guest_txvq.dtable[0],
                 &test_ctx.mem,
             );
-            expect_asm_error!(tx, test_ctx, handler_ctx, VsockError::InvalidPktLen(_));
+            assert!(matches!(
+                VsockPacketTx::default().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::InvalidPktLen(_))
+            ))
         }
 
         // Test case:
@@ -551,7 +494,13 @@ mod tests {
             create_context!(test_ctx, handler_ctx);
             set_pkt_len(1024, &handler_ctx.guest_txvq.dtable[0], &test_ctx.mem);
             handler_ctx.guest_txvq.dtable[0].flags.set(0);
-            expect_asm_error!(tx, test_ctx, handler_ctx, VsockError::BufDescMissing);
+            assert!(matches!(
+                VsockPacketTx::default().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::DescChainTooShortForPacket(44, 1024))
+            ))
         }
 
         // Test case: error on write-only buf descriptor.
@@ -560,16 +509,28 @@ mod tests {
             handler_ctx.guest_txvq.dtable[1]
                 .flags
                 .set(VIRTQ_DESC_F_WRITE);
-            expect_asm_error!(tx, test_ctx, handler_ctx, VsockError::UnreadableDescriptor);
+            assert!(matches!(
+                VsockPacketTx::default().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::UnreadableDescriptor)
+            ))
         }
 
-        // Test case: the buffer descriptor cannot fit all the data advertised by the the
+        // Test case: the buffer descriptor cannot fit all the data advertised by the
         // packet header `len` field.
         {
             create_context!(test_ctx, handler_ctx);
             set_pkt_len(8 * 1024, &handler_ctx.guest_txvq.dtable[0], &test_ctx.mem);
             handler_ctx.guest_txvq.dtable[1].len.set(4 * 1024);
-            expect_asm_error!(tx, test_ctx, handler_ctx, VsockError::BufDescTooSmall);
+            assert!(matches!(
+                VsockPacketTx::default().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::DescChainTooShortForPacket(4140, 8192))
+            ))
         }
     }
 
@@ -578,45 +539,42 @@ mod tests {
         // Test case: successful RX packet assembly.
         {
             create_context!(test_ctx, handler_ctx);
-            let pkt = VsockPacket::from_rx_virtq_head(
-                &handler_ctx.device.queues[RXQ_INDEX]
-                    .pop(&test_ctx.mem)
-                    .unwrap(),
+            let mut pkt = VsockPacketRx::new().unwrap();
+            pkt.parse(
+                &test_ctx.mem,
+                handler_ctx.device.queues[RXQ_INDEX].pop().unwrap(),
             )
             .unwrap();
-            assert_eq!(
-                pkt.buf_size,
-                handler_ctx.guest_rxvq.dtable[1].len.get() as usize
-            );
-            assert_eq!(
-                pkt.buf_addr.unwrap().0,
-                handler_ctx.guest_rxvq.dtable[1].addr.get()
-            );
+            assert_eq!(pkt.buf_size(), handler_ctx.guest_rxvq.dtable[1].len.get());
         }
 
         // Test case: read-only RX packet header.
         {
             create_context!(test_ctx, handler_ctx);
             handler_ctx.guest_rxvq.dtable[0].flags.set(0);
-            expect_asm_error!(rx, test_ctx, handler_ctx, VsockError::UnwritableDescriptor);
+            assert!(matches!(
+                VsockPacketRx::new().unwrap().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[RXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::UnwritableDescriptor)
+            ))
         }
 
-        // Test case: RX descriptor head cannot fit the entire packet header.
+        // Test case: RX descriptor chain cannot fit packet header
         {
             create_context!(test_ctx, handler_ctx);
             handler_ctx.guest_rxvq.dtable[0]
                 .len
-                .set(VSOCK_PKT_HDR_SIZE as u32 - 1);
-            expect_asm_error!(rx, test_ctx, handler_ctx, VsockError::HdrDescTooSmall(_));
-        }
-
-        // Test case: RX descriptor chain is missing the packet buffer descriptor.
-        {
-            create_context!(test_ctx, handler_ctx);
-            handler_ctx.guest_rxvq.dtable[0]
-                .flags
-                .set(VIRTQ_DESC_F_WRITE);
-            expect_asm_error!(rx, test_ctx, handler_ctx, VsockError::BufDescMissing);
+                .set(VSOCK_PKT_HDR_SIZE - 1);
+            handler_ctx.guest_rxvq.dtable[1].len.set(0);
+            assert!(matches!(
+                VsockPacketRx::new().unwrap().parse(
+                    &test_ctx.mem,
+                    handler_ctx.device.queues[RXQ_INDEX].pop().unwrap(),
+                ),
+                Err(VsockError::DescChainTooShortForHeader(_))
+            ))
         }
     }
 
@@ -634,16 +592,20 @@ mod tests {
         const BUF_ALLOC: u32 = 9;
         const FWD_CNT: u32 = 10;
 
-        create_context!(test_ctx, handler_ctx);
-        let mut pkt = VsockPacket::from_rx_virtq_head(
-            &handler_ctx.device.queues[RXQ_INDEX]
-                .pop(&test_ctx.mem)
-                .unwrap(),
-        )
-        .unwrap();
+        let mut hdr = VsockPacketHeader::default();
+        assert_eq!(hdr.src_cid(), 0);
+        assert_eq!(hdr.dst_cid(), 0);
+        assert_eq!(hdr.src_port(), 0);
+        assert_eq!(hdr.dst_port(), 0);
+        assert_eq!(hdr.len(), 0);
+        assert_eq!(hdr.type_(), 0);
+        assert_eq!(hdr.op(), 0);
+        assert_eq!(hdr.flags(), 0);
+        assert_eq!(hdr.buf_alloc(), 0);
+        assert_eq!(hdr.fwd_cnt(), 0);
 
         // Test field accessors.
-        pkt.set_src_cid(SRC_CID)
+        hdr.set_src_cid(SRC_CID)
             .set_dst_cid(DST_CID)
             .set_src_port(SRC_PORT)
             .set_dst_port(DST_PORT)
@@ -654,131 +616,80 @@ mod tests {
             .set_buf_alloc(BUF_ALLOC)
             .set_fwd_cnt(FWD_CNT);
 
-        assert_eq!(pkt.src_cid(), SRC_CID);
-        assert_eq!(pkt.dst_cid(), DST_CID);
-        assert_eq!(pkt.src_port(), SRC_PORT);
-        assert_eq!(pkt.dst_port(), DST_PORT);
-        assert_eq!(pkt.len(), LEN);
-        assert_eq!(pkt.type_(), TYPE);
-        assert_eq!(pkt.op(), OP);
-        assert_eq!(pkt.flags(), FLAGS);
-        assert_eq!(pkt.buf_alloc(), BUF_ALLOC);
-        assert_eq!(pkt.fwd_cnt(), FWD_CNT);
+        assert_eq!(hdr.src_cid(), SRC_CID);
+        assert_eq!(hdr.dst_cid(), DST_CID);
+        assert_eq!(hdr.src_port(), SRC_PORT);
+        assert_eq!(hdr.dst_port(), DST_PORT);
+        assert_eq!(hdr.len(), LEN);
+        assert_eq!(hdr.type_(), TYPE);
+        assert_eq!(hdr.op(), OP);
+        assert_eq!(hdr.flags(), FLAGS);
+        assert_eq!(hdr.buf_alloc(), BUF_ALLOC);
+        assert_eq!(hdr.fwd_cnt(), FWD_CNT);
 
         // Test individual flag setting.
-        let flags = pkt.flags() | 0b1000;
-        pkt.set_flag(0b1000);
-        assert_eq!(pkt.flags(), flags);
-
-        pkt.hdr = VsockPacketHeader::default();
-        assert_eq!(pkt.src_cid(), 0);
-        assert_eq!(pkt.dst_cid(), 0);
-        assert_eq!(pkt.src_port(), 0);
-        assert_eq!(pkt.dst_port(), 0);
-        assert_eq!(pkt.len(), 0);
-        assert_eq!(pkt.type_(), 0);
-        assert_eq!(pkt.op(), 0);
-        assert_eq!(pkt.flags(), 0);
-        assert_eq!(pkt.buf_alloc(), 0);
-        assert_eq!(pkt.fwd_cnt(), 0);
+        let flags = hdr.flags() | 0b1000;
+        hdr.set_flag(0b1000);
+        assert_eq!(hdr.flags(), flags);
     }
 
     #[test]
     fn test_packet_buf() {
         create_context!(test_ctx, handler_ctx);
-        let mut pkt = VsockPacket::from_rx_virtq_head(
-            &handler_ctx.device.queues[RXQ_INDEX]
-                .pop(&test_ctx.mem)
-                .unwrap(),
+        // create_context gives us an rx descriptor chain and a tx descriptor chain pointing to the
+        // same area of memory. We need both a rx-view and a tx-view into the packet, as tx-queue
+        // buffers are read only, while rx queue buffers are write-only
+        let mut pkt = VsockPacketRx::new().unwrap();
+        pkt.parse(
+            &test_ctx.mem,
+            handler_ctx.device.queues[RXQ_INDEX].pop().unwrap(),
+        )
+        .unwrap();
+        let mut pkt2 = VsockPacketTx::default();
+        pkt2.parse(
+            &test_ctx.mem,
+            handler_ctx.device.queues[TXQ_INDEX].pop().unwrap(),
         )
         .unwrap();
 
         let buf_desc = &mut handler_ctx.guest_rxvq.dtable[1];
-        assert_eq!(pkt.buf_size(), buf_desc.len.get() as usize);
-        assert_eq!(pkt.buf_addr.unwrap().raw_value(), buf_desc.addr.get());
-
-        let zeros = vec![0_u8; pkt.buf_size()];
-        let data: Vec<u8> = (0..pkt.buf_size()).map(|i| (i % 0x100) as u8).collect();
+        assert_eq!(pkt.buf_size(), buf_desc.len.get());
+        let zeros = vec![0_u8; pkt.buf_size() as usize];
+        let data: Vec<u8> = (0..pkt.buf_size())
+            .map(|i| ((i as u64) & 0xff) as u8)
+            .collect();
         for offset in 0..pkt.buf_size() {
             buf_desc.set_data(&zeros);
 
-            let mut expected_data = zeros[..offset].to_vec();
-            expected_data.extend_from_slice(&data[..pkt.buf_size() - offset]);
+            let mut expected_data = zeros[..offset as usize].to_vec();
+            expected_data.extend_from_slice(&data[..(pkt.buf_size() - offset) as usize]);
 
-            pkt.read_at_offset_from(
-                &test_ctx.mem,
-                offset,
-                &mut data.as_slice(),
-                pkt.buf_size() - offset,
-            )
-            .unwrap();
+            pkt.read_at_offset_from(&mut data.as_slice(), offset, pkt.buf_size() - offset)
+                .unwrap();
 
             buf_desc.check_data(&expected_data);
 
-            let mut buf = vec![0; pkt.buf_size()];
-            pkt.write_from_offset_to(
-                &test_ctx.mem,
-                offset,
-                &mut buf.as_mut_slice(),
-                pkt.buf_size() - offset,
-            )
-            .unwrap();
-            assert_eq!(&buf[..pkt.buf_size() - offset], &expected_data[offset..]);
+            let mut buf = vec![0; pkt.buf_size() as usize];
+            pkt2.write_from_offset_to(&mut buf.as_mut_slice(), offset, pkt.buf_size() - offset)
+                .unwrap();
+            assert_eq!(
+                &buf[..(pkt.buf_size() - offset) as usize],
+                &expected_data[offset as usize..]
+            );
         }
 
         let oob_cases = vec![
             (1, pkt.buf_size()),
             (pkt.buf_size(), 1),
-            (usize::MAX, 1),
-            (1, usize::MAX),
+            (u32::MAX, 1),
+            (1, u32::MAX),
         ];
-        let mut buf = vec![0; pkt.buf_size()];
+        let mut buf = vec![0; pkt.buf_size() as usize];
         for (offset, count) in oob_cases {
-            assert!(pkt
-                .read_at_offset_from(&test_ctx.mem, offset, &mut data.as_slice(), count)
-                .is_err());
-            assert!(pkt
-                .write_from_offset_to(&test_ctx.mem, offset, &mut buf.as_mut_slice(), count)
-                .is_err());
-        }
-    }
-
-    #[test]
-    fn test_check_bounds_for_buffer_access_edge_cases() {
-        let mut test_ctx = TestContext::new();
-
-        test_ctx.mem = utils::vm_memory::test_utils::create_guest_memory_unguarded(
-            &[
-                (GuestAddress(0), 500),
-                (GuestAddress(500), 100),
-                (GuestAddress(600), 100),
-            ],
-            false,
-        )
-        .unwrap();
-
-        let edge_cases = vec![
-            // valid packet, but offset = buf_size
-            (GuestAddress(100), 100, 100, 0),
-            // valid packet, but offset > buf_size
-            (GuestAddress(100), 100, 101, 0),
-            // valid packet, but offset + count > buf_size
-            (GuestAddress(100), 100, 50, 51),
-            // packet that crosses into the Gap
-            (GuestAddress(450), 100, 0, 100),
-            // packet that crosses over the Gap
-            (GuestAddress(450), 200, 0, 200),
-        ];
-        for (buf_addr, buf_size, offset, count) in edge_cases {
-            let pkt = VsockPacket {
-                hdr_addr: GuestAddress(0),
-                hdr: Default::default(),
-                buf_addr: Some(buf_addr),
-                buf_size,
-            };
-            assert!(pkt
-                .check_bounds_for_buffer_access(&test_ctx.mem, offset, count)
-                .is_err());
+            let res = pkt.read_at_offset_from(&mut data.as_slice(), offset, count);
+            assert!(matches!(res, Err(VsockError::GuestMemoryBounds)));
+            let res = pkt2.write_from_offset_to(&mut buf.as_mut_slice(), offset, count);
+            assert!(matches!(res, Err(VsockError::GuestMemoryBounds)));
         }
     }
 }

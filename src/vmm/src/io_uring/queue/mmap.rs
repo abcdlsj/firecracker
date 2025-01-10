@@ -4,11 +4,15 @@
 use std::io::Error as IOError;
 use std::os::unix::io::RawFd;
 
-use utils::vm_memory::{MmapRegion, MmapRegionError};
+use vm_memory::mmap::MmapRegionError;
 
-#[derive(Debug)]
+use crate::vstate::memory::MmapRegion;
+
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MmapError {
+    /// Os: {0}
     Os(IOError),
+    /// BuildMmapRegion: {0}
     BuildMmapRegion(MmapRegionError),
 }
 

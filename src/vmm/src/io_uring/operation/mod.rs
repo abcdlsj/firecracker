@@ -12,21 +12,23 @@ use std::fmt::{self, Debug};
 pub use cqe::Cqe;
 pub(crate) use sqe::Sqe;
 
-use crate::io_uring::bindings::{self, io_uring_sqe, IOSQE_FIXED_FILE_BIT};
+use crate::io_uring::gen::{self, io_uring_sqe, IOSQE_FIXED_FILE_BIT};
 
 /// The index of a registered fd.
 pub type FixedFd = u32;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
+// These constants are generated as u32, but we use u8; const try_from() is unstable
+#[allow(clippy::cast_possible_truncation)]
 /// Supported operation types.
 pub enum OpCode {
     /// Read operation.
-    Read = bindings::IORING_OP_READ as u8,
+    Read = gen::IORING_OP_READ as u8,
     /// Write operation.
-    Write = bindings::IORING_OP_WRITE as u8,
+    Write = gen::IORING_OP_WRITE as u8,
     /// Fsync operation.
-    Fsync = bindings::IORING_OP_FSYNC as u8,
+    Fsync = gen::IORING_OP_FSYNC as u8,
 }
 
 // Useful for outputting errors.
@@ -49,7 +51,7 @@ pub struct Operation<T> {
     pub(crate) len: Option<u32>,
     flags: u8,
     pub(crate) offset: Option<u64>,
-    user_data: Box<T>,
+    pub(crate) user_data: T,
 }
 
 // Needed for proptesting.
@@ -81,7 +83,7 @@ impl<T: Debug> Operation<T> {
             len: Some(len),
             flags: 0,
             offset: Some(offset),
-            user_data: Box::new(user_data),
+            user_data,
         }
     }
 
@@ -94,7 +96,7 @@ impl<T: Debug> Operation<T> {
             len: Some(len),
             flags: 0,
             offset: Some(offset),
-            user_data: Box::new(user_data),
+            user_data,
         }
     }
 
@@ -107,7 +109,7 @@ impl<T: Debug> Operation<T> {
             len: None,
             flags: 0,
             offset: None,
-            user_data: Box::new(user_data),
+            user_data,
         }
     }
 
@@ -115,25 +117,18 @@ impl<T: Debug> Operation<T> {
         self.fd
     }
 
-    /// Consumes the operation and returns the associated `user_data`.
-    pub fn user_data(self) -> T {
-        *self.user_data
-    }
-
     // Needed for proptesting.
     #[cfg(test)]
     pub(crate) fn set_linked(&mut self) {
-        self.flags |= 1 << bindings::IOSQE_IO_LINK_BIT;
+        self.flags |= 1 << gen::IOSQE_IO_LINK_BIT;
     }
 
     /// Transform the operation into an `Sqe`.
-    ///
-    /// # Safety
-    /// Unsafe because we turn the Boxed user_data into a raw pointer contained in the sqe.
-    /// It's up to the caller to make sure that this value is freed (not leaked).
-    pub(crate) unsafe fn into_sqe(self) -> Sqe {
+    /// Note: remember remove user_data from slab or it will leak.
+    pub(crate) fn into_sqe(self, slab: &mut slab::Slab<T>) -> Sqe {
+        // SAFETY:
         // Safe because all-zero value is valid. The sqe is made up of integers and raw pointers.
-        let mut inner: io_uring_sqe = std::mem::zeroed();
+        let mut inner: io_uring_sqe = unsafe { std::mem::zeroed() };
 
         inner.opcode = self.opcode as u8;
         inner.fd = i32::try_from(self.fd).unwrap();
@@ -151,7 +146,7 @@ impl<T: Debug> Operation<T> {
         if let Some(offset) = self.offset {
             inner.__bindgen_anon_1.off = offset;
         }
-        inner.user_data = Box::into_raw(self.user_data) as u64;
+        inner.user_data = slab.insert(self.user_data) as u64;
 
         Sqe::new(inner)
     }
