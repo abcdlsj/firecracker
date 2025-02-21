@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from framework.properties import global_props
+from framework.artifacts import working_version_as_artifact
 from framework.utils import (
     configure_mmds,
     generate_mmds_get_request,
@@ -17,7 +17,6 @@ from framework.utils import (
     populate_data_store,
     run_guest_cmd,
 )
-from host_tools.cargo_build import get_firecracker_binaries
 
 # Minimum lifetime of token.
 MIN_TOKEN_TTL_SECONDS = 1
@@ -33,7 +32,6 @@ def _validate_mmds_snapshot(
     basevm,
     microvm_factory,
     version,
-    target_fc_version=None,
     fc_binary_path=None,
     jailer_binary_path=None,
 ):
@@ -76,7 +74,7 @@ def _validate_mmds_snapshot(
     run_guest_cmd(ssh_connection, cmd, data_store, use_json=True)
 
     # Create snapshot.
-    snapshot = basevm.snapshot_full(target_version=target_fc_version)
+    snapshot = basevm.snapshot_full()
 
     # Resume microVM and ensure session token is still valid on the base.
     response = basevm.resume()
@@ -88,12 +86,14 @@ def _validate_mmds_snapshot(
     basevm.kill()
 
     # Load microVM clone from snapshot.
-    microvm = microvm_factory.build(
-        fc_binary_path=fc_binary_path, jailer_binary_path=jailer_binary_path
-    )
+    kwargs = {}
+    if fc_binary_path:
+        kwargs["fc_binary_path"] = fc_binary_path
+    if jailer_binary_path:
+        kwargs["jailer_binary_path"] = jailer_binary_path
+    microvm = microvm_factory.build(**kwargs)
     microvm.spawn()
-    microvm.restore_from_snapshot(snapshot)
-    microvm.resume()
+    microvm.restore_from_snapshot(snapshot, resume=True)
 
     ssh_connection = microvm.ssh
 
@@ -129,11 +129,11 @@ def _validate_mmds_snapshot(
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_custom_ipv4(test_microvm_with_api, version):
+def test_custom_ipv4(uvm_plain, version):
     """
     Test the API for MMDS custom ipv4 support.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     data_store = {
@@ -216,11 +216,11 @@ def test_custom_ipv4(test_microvm_with_api, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_json_response(test_microvm_with_api, version):
+def test_json_response(uvm_plain, version):
     """
     Test the MMDS json response.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     data_store = {
@@ -277,11 +277,11 @@ def test_json_response(test_microvm_with_api, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_mmds_response(test_microvm_with_api, version):
+def test_mmds_response(uvm_plain, version):
     """
     Test MMDS responses to various datastore requests.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     data_store = {
@@ -295,6 +295,7 @@ def test_mmds_response(test_microvm_with_api, version):
                     "res_key": "res_value",
                 },
                 "dummy_array": ["arr_val1", "arr_val2"],
+                "dummy_empty": "",
             },
             "Limits": {"CPU": 512, "Memory": 512},
             "Usage": {"CPU": 12.12},
@@ -327,12 +328,12 @@ def test_mmds_response(test_microvm_with_api, version):
     expected = (
         "ami-id\n"
         "dummy_array\n"
+        "dummy_empty\n"
         "dummy_obj/\n"
         "local-hostname\n"
         "public-hostname\n"
         "reservation-id"
     )
-
     run_guest_cmd(ssh_connection, cmd, expected)
 
     cmd = pre + "latest/meta-data/ami-id/"
@@ -340,6 +341,9 @@ def test_mmds_response(test_microvm_with_api, version):
 
     cmd = pre + "latest/meta-data/dummy_array/0"
     run_guest_cmd(ssh_connection, cmd, "arr_val1")
+
+    cmd = pre + "latest/meta-data/dummy_empty"
+    run_guest_cmd(ssh_connection, cmd, "")
 
     cmd = pre + "latest/Usage/CPU"
     run_guest_cmd(
@@ -357,11 +361,11 @@ def test_mmds_response(test_microvm_with_api, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_larger_than_mss_payloads(test_microvm_with_api, version):
+def test_larger_than_mss_payloads(uvm_plain, version):
     """
     Test MMDS content for payloads larger than MSS.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     # Attach network device.
@@ -425,11 +429,11 @@ def test_larger_than_mss_payloads(test_microvm_with_api, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_mmds_dummy(test_microvm_with_api, version):
+def test_mmds_dummy(uvm_plain, version):
     """
     Test the API and guest facing features of the microVM MetaData Service.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     # Attach network device.
@@ -470,11 +474,11 @@ def test_mmds_dummy(test_microvm_with_api, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_guest_mmds_hang(test_microvm_with_api, version):
+def test_guest_mmds_hang(uvm_plain, version):
     """
     Test the MMDS json endpoint when Content-Length larger than actual length.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     # Attach network device.
@@ -523,11 +527,11 @@ def test_guest_mmds_hang(test_microvm_with_api, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_mmds_limit_scenario(test_microvm_with_api, version):
+def test_mmds_limit_scenario(uvm_plain, version):
     """
     Test the MMDS json endpoint when data store size reaches the limit.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     # Set a large enough limit for the API so that requests actually reach the
     # MMDS server.
     test_microvm.jailer.extra_args.update(
@@ -591,7 +595,7 @@ def test_mmds_limit_scenario(test_microvm_with_api, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_mmds_snapshot(uvm_nano, microvm_factory, version, firecracker_release):
+def test_mmds_snapshot(uvm_nano, microvm_factory, version):
     """
     Test MMDS behavior by restoring a snapshot on current FC versions.
 
@@ -599,57 +603,22 @@ def test_mmds_snapshot(uvm_nano, microvm_factory, version, firecracker_release):
     the firecracker version does not support it.
     """
 
+    current_release = working_version_as_artifact()
     uvm_nano.add_net_iface()
     _validate_mmds_snapshot(
         uvm_nano,
         microvm_factory,
         version,
-        target_fc_version=firecracker_release.snapshot_version,
-        fc_binary_path=firecracker_release.path,
-        jailer_binary_path=firecracker_release.jailer,
+        fc_binary_path=current_release.path,
+        jailer_binary_path=current_release.jailer,
     )
 
 
-def test_mmds_older_snapshot(
-    microvm_factory, guest_kernel, rootfs, firecracker_release
-):
-    """
-    Test MMDS behavior restoring older snapshots in the current version.
-
-    Ensures that the MMDS version is persisted or initialised with the default
-    if the FC version does not support this feature.
-    """
-
-    # due to bug fixed in commit 8dab78b
-    firecracker_version = firecracker_release.version_tuple
-    if global_props.instance == "m6a.metal" and firecracker_version < (1, 3, 3):
-        pytest.skip("incompatible with AMD and Firecracker <1.3.3")
-
-    microvm = microvm_factory.build(
-        guest_kernel,
-        rootfs,
-        fc_binary_path=firecracker_release.path,
-        jailer_binary_path=firecracker_release.jailer,
-    )
-    microvm.spawn()
-    microvm.basic_config()
-    microvm.add_net_iface()
-
-    mmds_version = "V2"
-    _validate_mmds_snapshot(
-        microvm,
-        microvm_factory,
-        mmds_version,
-        firecracker_release.snapshot_version,
-        *get_firecracker_binaries(),
-    )
-
-
-def test_mmds_v2_negative(test_microvm_with_api):
+def test_mmds_v2_negative(uvm_plain):
     """
     Test invalid MMDS GET/PUT requests when using V2.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
 
     # Attach network device.
@@ -750,11 +719,11 @@ def test_mmds_v2_negative(test_microvm_with_api):
     )
 
 
-def test_deprecated_mmds_config(test_microvm_with_api):
+def test_deprecated_mmds_config(uvm_plain):
     """
     Test deprecated Mmds configs.
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.spawn()
     test_microvm.basic_config()
     # Attach network device.

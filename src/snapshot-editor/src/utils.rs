@@ -4,9 +4,10 @@
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
-use snapshot::Snapshot;
+use semver::Version;
 use vmm::persist::MicrovmState;
-use vmm::version_map::VERSION_MAP;
+use vmm::snapshot::Snapshot;
+use vmm::utils::u64_to_usize;
 
 // Some errors are only used in aarch64 code
 #[allow(unused)]
@@ -17,20 +18,19 @@ pub enum UtilsError {
     /// Can not retrieve metadata for snapshot file: {0}
     VmStateFileMeta(std::io::Error),
     /// Can not load snapshot: {0}
-    VmStateLoad(snapshot::Error),
+    VmStateLoad(vmm::snapshot::SnapshotError),
     /// Can not open output file: {0}
     OutputFileOpen(std::io::Error),
     /// Can not save snapshot: {0}
-    VmStateSave(snapshot::Error),
+    VmStateSave(vmm::snapshot::SnapshotError),
 }
 
 #[allow(unused)]
-pub fn open_vmstate(snapshot_path: &PathBuf) -> Result<(MicrovmState, u16), UtilsError> {
-    let version_map = VERSION_MAP.clone();
+pub fn open_vmstate(snapshot_path: &PathBuf) -> Result<(MicrovmState, Version), UtilsError> {
     let mut snapshot_reader = File::open(snapshot_path).map_err(UtilsError::VmStateFileOpen)?;
     let metadata = std::fs::metadata(snapshot_path).map_err(UtilsError::VmStateFileMeta)?;
-    let snapshot_len = metadata.len() as usize;
-    Snapshot::load(&mut snapshot_reader, snapshot_len, version_map).map_err(UtilsError::VmStateLoad)
+    let snapshot_len = u64_to_usize(metadata.len());
+    Snapshot::load(&mut snapshot_reader, snapshot_len).map_err(UtilsError::VmStateLoad)
 }
 
 // This method is used only in aarch64 code so far
@@ -38,16 +38,15 @@ pub fn open_vmstate(snapshot_path: &PathBuf) -> Result<(MicrovmState, u16), Util
 pub fn save_vmstate(
     microvm_state: MicrovmState,
     output_path: &PathBuf,
-    version: u16,
+    version: Version,
 ) -> Result<(), UtilsError> {
-    let version_map = VERSION_MAP.clone();
     let mut output_file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(output_path)
         .map_err(UtilsError::OutputFileOpen)?;
-    let mut snapshot = Snapshot::new(version_map, version);
+    let mut snapshot = Snapshot::new(version);
     snapshot
         .save(&mut output_file, &microvm_state)
         .map_err(UtilsError::VmStateSave)?;

@@ -14,6 +14,7 @@
 mod csm;
 mod device;
 mod event_handler;
+pub mod metrics;
 mod packet;
 pub mod persist;
 pub mod test_utils;
@@ -21,18 +22,20 @@ mod unix;
 
 use std::os::unix::io::AsRawFd;
 
-use packet::VsockPacket;
-use utils::epoll::EventSet;
-use utils::vm_memory::{GuestMemoryError, GuestMemoryMmap};
+use vm_memory::GuestMemoryError;
+use vmm_sys_util::epoll::EventSet;
 
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::defs::VSOCK_DEV_ID;
 pub use self::device::Vsock;
+use self::packet::{VsockPacketRx, VsockPacketTx};
 pub use self::unix::{VsockUnixBackend, VsockUnixBackendError};
+use super::iov_deque::IovDequeError;
+use crate::devices::virtio::iovec::IoVecError;
 use crate::devices::virtio::persist::PersistError as VirtioStateError;
 
 mod defs {
-    use crate::devices::virtio::FIRECRACKER_MAX_QUEUE_SIZE;
+    use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 
     /// Device ID used in MMIO device identification.
     /// Because Vsock is unique per-vm, this ID can be hardcoded.
@@ -50,7 +53,7 @@ mod defs {
     ];
 
     /// Max vsock packet data/buffer size.
-    pub const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
+    pub const MAX_PKT_BUF_SIZE: u32 = 64 * 1024;
 
     pub mod uapi {
 
@@ -104,23 +107,25 @@ mod defs {
 }
 
 /// Vsock device related errors.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+#[rustfmt::skip]
 pub enum VsockError {
-    /// The vsock data/buffer virtio descriptor length is smaller than expected.
-    BufDescTooSmall,
-    /// The vsock data/buffer virtio descriptor is expected, but missing.
-    BufDescMissing,
+    /** The total length of the descriptor chain ({0}) is too short to hold a packet of length {1} + header */
+    DescChainTooShortForPacket(u32, u32),
     /// Empty queue
     EmptyQueue,
-    /// EventFd error
+    /// EventFd error: {0}
     EventFd(std::io::Error),
-    /// Chained GuestMemoryMmap error.
+    /// Chained GuestMemoryMmap error: {0}
     GuestMemoryMmap(GuestMemoryError),
     /// Bounds check failed on guest memory pointer.
     GuestMemoryBounds,
-    /// The vsock header descriptor length is too small.
-    HdrDescTooSmall(u32),
-    /// The vsock header `len` field holds an invalid value.
+    /** The total length of the descriptor chain ({0}) is less than the number of bytes required\
+    to hold a vsock packet header.*/
+    DescChainTooShortForHeader(usize),
+    /// The descriptor chain length was greater than the max ([u32::MAX])
+    DescChainOverflow,
+    /// The vsock header `len` field holds an invalid value: {0}
     InvalidPktLen(u32),
     /// A data fetch was attempted when no data was available.
     NoData,
@@ -130,9 +135,27 @@ pub enum VsockError {
     UnreadableDescriptor,
     /// Encountered an unexpected read-only virtio descriptor.
     UnwritableDescriptor,
-    /// Invalid virtio configuration.
+    /// Invalid virtio configuration: {0}
     VirtioState(VirtioStateError),
+    /// Vsock uds backend error: {0}
     VsockUdsBackend(VsockUnixBackendError),
+    /// Underlying IovDeque error: {0}
+    IovDeque(IovDequeError),
+    /// Tried to push to full IovDeque.
+    IovDequeOverflow,
+}
+
+impl From<IoVecError> for VsockError {
+    fn from(value: IoVecError) -> Self {
+        match value {
+            IoVecError::WriteOnlyDescriptor => VsockError::UnreadableDescriptor,
+            IoVecError::ReadOnlyDescriptor => VsockError::UnwritableDescriptor,
+            IoVecError::GuestMemory(err) => VsockError::GuestMemoryMmap(err),
+            IoVecError::OverflowedDescriptor => VsockError::DescChainOverflow,
+            IoVecError::IovDeque(err) => VsockError::IovDeque(err),
+            IoVecError::IovDequeOverflow => VsockError::IovDequeOverflow,
+        }
+    }
 }
 
 /// A passive, event-driven object, that needs to be notified whenever an epoll-able event occurs.
@@ -158,10 +181,10 @@ pub trait VsockEpollListener: AsRawFd {
 ///       - `send_pkt(&pkt)` will fetch data from `pkt`, and place it into the channel.
 pub trait VsockChannel {
     /// Read/receive an incoming packet from the channel.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacket, mem: &GuestMemoryMmap) -> Result<(), VsockError>;
+    fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError>;
 
     /// Write/send a packet through the channel.
-    fn send_pkt(&mut self, pkt: &VsockPacket, mem: &GuestMemoryMmap) -> Result<(), VsockError>;
+    fn send_pkt(&mut self, pkt: &VsockPacketTx) -> Result<(), VsockError>;
 
     /// Checks whether there is pending incoming data inside the channel, meaning that a subsequent
     /// call to `recv_pkt()` won't fail.

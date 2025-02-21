@@ -30,7 +30,7 @@ const GICD_SPENDSGIR: DistReg = DistReg::simple(0xF20, 16);
 // List with relevant distributor registers that we will be restoring.
 // Order is taken from qemu.
 // Criteria for the present list of registers: only R/W registers, implementation specific registers
-// are not saved. NOTICE: Any changes to this structure require a snapshot version bump.
+// are not saved.
 static VGIC_DIST_REGS: &[DistReg] = &[
     GICD_CTLR,
     GICD_ICENABLER,
@@ -147,22 +147,23 @@ mod tests {
         };
 
         let res = get_dist_regs(gic_fd.device_fd());
-        assert!(res.is_ok());
         let state = res.unwrap();
         assert_eq!(state.len(), 7);
         // Check GICD_CTLR size.
         assert_eq!(state[0].chunks.len(), 1);
 
         let res = set_dist_regs(gic_fd.device_fd(), &state);
-        assert!(res.is_ok());
+        res.unwrap();
 
         unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
 
         let res = get_dist_regs(gic_fd.device_fd());
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 1)"
         );
+
+        // dropping gic_fd would double close the gic fd, so leak it
+        std::mem::forget(gic_fd);
     }
 }

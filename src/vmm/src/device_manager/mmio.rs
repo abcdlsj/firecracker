@@ -7,17 +7,20 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_arch = "x86_64")]
+use acpi_tables::{aml, Aml};
 use kvm_ioctls::{IoEventAddress, VmFd};
 use linux_loader::cmdline as kernel_cmdline;
-use log::info;
 #[cfg(target_arch = "x86_64")]
-use utils::vm_memory::GuestAddress;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
-use vm_allocator::{AddressAllocator, AllocPolicy, IdAllocator};
+use log::debug;
+use log::info;
+use serde::{Deserialize, Serialize};
+use vm_allocator::AllocPolicy;
 
+use super::resources::ResourceAllocator;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::DeviceInfoForFDT;
 use crate::arch::DeviceType;
@@ -25,17 +28,23 @@ use crate::arch::DeviceType::Virtio;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::RTCDevice;
 use crate::devices::pseudo::BootTimer;
-use crate::devices::virtio::{
-    Balloon, Block, Entropy, MmioTransport, Net, VirtioDevice, TYPE_BALLOON, TYPE_BLOCK, TYPE_NET,
-    TYPE_RNG, TYPE_VSOCK,
-};
+use crate::devices::virtio::balloon::Balloon;
+use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::mmio::MmioTransport;
+use crate::devices::virtio::net::Net;
+use crate::devices::virtio::rng::Entropy;
+use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend, TYPE_VSOCK};
+use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
 use crate::devices::BusDevice;
+#[cfg(target_arch = "x86_64")]
+use crate::vstate::memory::GuestAddress;
 
 /// Errors for MMIO device manager.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MmioError {
     /// Failed to allocate requested resource: {0}
-    Allocator(vm_allocator::Error),
+    Allocator(#[from] vm_allocator::Error),
     /// Failed to insert device on the bus: {0}
     BusInsert(crate::devices::BusError),
     /// Failed to allocate requested resourc: {0}
@@ -52,65 +61,110 @@ pub enum MmioError {
     RegisterIoEvent(kvm_ioctls::Error),
     /// Failed to register irqfd: {0}
     RegisterIrqFd(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to create AML code for device
+    AmlError(#[from] aml::AmlError),
 }
 
-/// This represents the size of the mmio device specified to the kernel as a cmdline option
+/// This represents the size of the mmio device specified to the kernel through ACPI and as a
+/// command line option.
 /// It has to be larger than 0x100 (the offset where the configuration space starts from
 /// the beginning of the memory mapped device registers) + the size of the configuration space
 /// Currently hardcoded to 4K.
 pub const MMIO_LEN: u64 = 0x1000;
 
 /// Stores the address range and irq allocated to this device.
-#[derive(Clone, Debug, PartialEq, Eq, Versionize)]
-// NOTICE: Any changes to this structure require a snapshot version bump.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MMIODeviceInfo {
     /// Mmio address at which the device is registered.
     pub addr: u64,
     /// Mmio addr range length.
     pub len: u64,
-    /// Used Irq line(s) for the device.
-    pub irqs: Vec<u32>,
+    /// Used Irq line for the device.
+    pub irq: Option<NonZeroU32>, // NOTE: guaranteed to be a value not 0, 0 is not allowed
+}
+
+#[cfg(target_arch = "x86_64")]
+fn add_virtio_aml(
+    dsdt_data: &mut Vec<u8>,
+    addr: u64,
+    len: u64,
+    irq: u32,
+) -> Result<(), aml::AmlError> {
+    let dev_id = irq - crate::arch::IRQ_BASE;
+    debug!(
+        "acpi: Building AML for VirtIO device _SB_.V{:03}. memory range: {:#010x}:{} irq: {}",
+        dev_id, addr, len, irq
+    );
+    aml::Device::new(
+        format!("V{:03}", dev_id).as_str().try_into()?,
+        vec![
+            &aml::Name::new("_HID".try_into()?, &"LNRO0005")?,
+            &aml::Name::new("_UID".try_into()?, &dev_id)?,
+            &aml::Name::new("_CCA".try_into()?, &aml::ONE)?,
+            &aml::Name::new(
+                "_CRS".try_into()?,
+                &aml::ResourceTemplate::new(vec![
+                    &aml::Memory32Fixed::new(
+                        true,
+                        addr.try_into().unwrap(),
+                        len.try_into().unwrap(),
+                    ),
+                    &aml::Interrupt::new(true, true, false, false, irq),
+                ]),
+            )?,
+        ],
+    )
+    .append_aml_bytes(dsdt_data)
 }
 
 /// Manages the complexities of registering a MMIO device.
 #[derive(Debug)]
 pub struct MMIODeviceManager {
     pub(crate) bus: crate::devices::Bus,
-    pub(crate) irq_allocator: IdAllocator,
-    pub(crate) address_allocator: AddressAllocator,
     pub(crate) id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    // We create the AML byte code for every VirtIO device in the order we build
+    // it, so that we ensure the root block device is appears first in the DSDT.
+    // This is needed, so that the root device appears as `/dev/vda` in the guest
+    // filesystem.
+    // The alternative would be that we iterate the bus to get the data after all
+    // of the devices are build. However, iterating the bus won't give us the
+    // devices in the order they were added.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) dsdt_data: Vec<u8>,
 }
 
 impl MMIODeviceManager {
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
-    pub fn new(
-        mmio_base: u64,
-        mmio_size: u64,
-        (irq_start, irq_end): (u32, u32),
-    ) -> Result<MMIODeviceManager, MmioError> {
-        Ok(MMIODeviceManager {
-            irq_allocator: IdAllocator::new(irq_start, irq_end).map_err(MmioError::Allocator)?,
-            address_allocator: AddressAllocator::new(mmio_base, mmio_size)
-                .map_err(MmioError::Allocator)?,
+    pub fn new() -> MMIODeviceManager {
+        MMIODeviceManager {
             bus: crate::devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
-        })
+            #[cfg(target_arch = "x86_64")]
+            dsdt_data: vec![],
+        }
     }
 
     /// Allocates resources for a new device to be added.
-    fn allocate_mmio_resources(&mut self, irq_count: u32) -> Result<MMIODeviceInfo, MmioError> {
-        let irqs = (0..irq_count)
-            .map(|_| self.irq_allocator.allocate_id())
-            .collect::<vm_allocator::Result<_>>()
-            .map_err(MmioError::Allocator)?;
+    fn allocate_mmio_resources(
+        &mut self,
+        resource_allocator: &mut ResourceAllocator,
+        irq_count: u32,
+    ) -> Result<MMIODeviceInfo, MmioError> {
+        let irq = match resource_allocator.allocate_gsi(irq_count)?[..] {
+            [] => None,
+            [irq] => NonZeroU32::new(irq),
+            _ => return Err(MmioError::InvalidIrqConfig),
+        };
+
         let device_info = MMIODeviceInfo {
-            addr: self
-                .address_allocator
-                .allocate(MMIO_LEN, MMIO_LEN, AllocPolicy::FirstMatch)
-                .map_err(MmioError::Allocator)?
-                .start(),
+            addr: resource_allocator.allocate_mmio_memory(
+                MMIO_LEN,
+                MMIO_LEN,
+                AllocPolicy::FirstMatch,
+            )?,
             len: MMIO_LEN,
-            irqs,
+            irq,
         };
         Ok(device_info)
     }
@@ -139,9 +193,9 @@ impl MMIODeviceManager {
     ) -> Result<(), MmioError> {
         // Our virtio devices are currently hardcoded to use a single IRQ.
         // Validate that requirement.
-        if device_info.irqs.len() != 1 {
+        let Some(irq) = device_info.irq else {
             return Err(MmioError::InvalidIrqConfig);
-        }
+        };
         let identifier;
         {
             let locked_device = mmio_device.locked_device();
@@ -150,10 +204,10 @@ impl MMIODeviceManager {
                 let io_addr = IoEventAddress::Mmio(
                     device_info.addr + u64::from(crate::devices::virtio::NOTIFY_REG_OFFSET),
                 );
-                vm.register_ioevent(queue_evt, &io_addr, i as u32)
+                vm.register_ioevent(queue_evt, &io_addr, u32::try_from(i).unwrap())
                     .map_err(MmioError::RegisterIoEvent)?;
             }
-            vm.register_irqfd(locked_device.interrupt_evt(), device_info.irqs[0])
+            vm.register_irqfd(&locked_device.interrupt_trigger().irq_evt, irq.get())
                 .map_err(MmioError::RegisterIrqFd)?;
         }
 
@@ -171,7 +225,7 @@ impl MMIODeviceManager {
         device_info: &MMIODeviceInfo,
     ) -> Result<(), MmioError> {
         // as per doc, [virtio_mmio.]device=<size>@<baseaddr>:<irq> needs to be appended
-        // to kernel commandline for virtio mmio devices to get recognized
+        // to kernel command line for virtio mmio devices to get recongnized
         // the size parameter has to be transformed to KiB, so dividing hexadecimal value in
         // bytes to 1024; further, the '{}' formatting rust construct will automatically
         // transform it to decimal
@@ -179,7 +233,7 @@ impl MMIODeviceManager {
             .add_virtio_mmio_device(
                 device_info.len,
                 GuestAddress(device_info.addr),
-                device_info.irqs[0],
+                device_info.irq.unwrap().get(),
                 None,
             )
             .map_err(MmioError::Cmdline)
@@ -190,14 +244,25 @@ impl MMIODeviceManager {
     pub fn register_mmio_virtio_for_boot(
         &mut self,
         vm: &VmFd,
+        resource_allocator: &mut ResourceAllocator,
         device_id: String,
         mmio_device: MmioTransport,
         _cmdline: &mut kernel_cmdline::Cmdline,
     ) -> Result<MMIODeviceInfo, MmioError> {
-        let device_info = self.allocate_mmio_resources(1)?;
+        let device_info = self.allocate_mmio_resources(resource_allocator, 1)?;
         self.register_mmio_virtio(vm, device_id, mmio_device, &device_info)?;
         #[cfg(target_arch = "x86_64")]
-        Self::add_virtio_device_to_cmdline(_cmdline, &device_info)?;
+        {
+            Self::add_virtio_device_to_cmdline(_cmdline, &device_info)?;
+            add_virtio_aml(
+                &mut self.dsdt_data,
+                device_info.addr,
+                device_info.len,
+                // We are sure that `irqs` has at least one element; allocate_mmio_resources makes
+                // sure of it.
+                device_info.irq.unwrap().get(),
+            )?;
+        }
         Ok(device_info)
     }
 
@@ -207,6 +272,7 @@ impl MMIODeviceManager {
     pub fn register_mmio_serial(
         &mut self,
         vm: &VmFd,
+        resource_allocator: &mut ResourceAllocator,
         serial: Arc<Mutex<BusDevice>>,
         device_info_opt: Option<MMIODeviceInfo>,
     ) -> Result<(), MmioError> {
@@ -215,7 +281,7 @@ impl MMIODeviceManager {
         let device_info = if let Some(device_info) = device_info_opt {
             device_info
         } else {
-            self.allocate_mmio_resources(1)?
+            self.allocate_mmio_resources(resource_allocator, 1)?
         };
 
         vm.register_irqfd(
@@ -226,7 +292,7 @@ impl MMIODeviceManager {
                 .unwrap()
                 .serial
                 .interrupt_evt(),
-            device_info.irqs[0],
+            device_info.irq.unwrap().get(),
         )
         .map_err(MmioError::RegisterIrqFd)?;
 
@@ -255,6 +321,7 @@ impl MMIODeviceManager {
     /// given as parameter, otherwise allocate a new MMIO resources for it.
     pub fn register_mmio_rtc(
         &mut self,
+        resource_allocator: &mut ResourceAllocator,
         rtc: RTCDevice,
         device_info_opt: Option<MMIODeviceInfo>,
     ) -> Result<(), MmioError> {
@@ -263,7 +330,7 @@ impl MMIODeviceManager {
         let device_info = if let Some(device_info) = device_info_opt {
             device_info
         } else {
-            self.allocate_mmio_resources(1)?
+            self.allocate_mmio_resources(resource_allocator, 1)?
         };
 
         // Create a new identifier for the RTC device.
@@ -277,9 +344,13 @@ impl MMIODeviceManager {
     }
 
     /// Register a boot timer device.
-    pub fn register_mmio_boot_timer(&mut self, device: BootTimer) -> Result<(), MmioError> {
+    pub fn register_mmio_boot_timer(
+        &mut self,
+        resource_allocator: &mut ResourceAllocator,
+        device: BootTimer,
+    ) -> Result<(), MmioError> {
         // Attach a new boot timer device.
-        let device_info = self.allocate_mmio_resources(0)?;
+        let device_info = self.allocate_mmio_resources(resource_allocator, 0)?;
 
         let identifier = (DeviceType::BootTimer, DeviceType::BootTimer.to_string());
         self.register_mmio_device(
@@ -292,16 +363,6 @@ impl MMIODeviceManager {
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    /// Gets the number of interrupts used by the devices registered.
-    pub fn used_irqs_count(&self) -> usize {
-        let mut irq_number = 0;
-        self.get_device_info()
-            .iter()
-            .for_each(|(_, device_info)| irq_number += device_info.irqs.len());
-        irq_number
     }
 
     /// Gets the specified device.
@@ -406,14 +467,18 @@ impl MMIODeviceManager {
                         }
                     }
                     TYPE_BLOCK => {
-                        let block = virtio.as_mut_any().downcast_mut::<Block>().unwrap();
-                        // If device is activated, kick the block queue(s) to make up for any
-                        // pending or in-flight epoll events we may have not captured in snapshot.
-                        // No need to kick Ratelimiters because they are restored 'unblocked' so
-                        // any inflight `timer_fd` events can be safely discarded.
-                        if block.is_activated() {
-                            info!("kick block {}.", id);
-                            block.process_virtio_queues();
+                        // We only care about kicking virtio block.
+                        // If we need to kick vhost-user-block we can do nothing.
+                        if let Some(block) = virtio.as_mut_any().downcast_mut::<Block>() {
+                            // If device is activated, kick the block queue(s) to make up for any
+                            // pending or in-flight epoll events we may have not captured in
+                            // snapshot. No need to kick Ratelimiters
+                            // because they are restored 'unblocked' so
+                            // any inflight `timer_fd` events can be safely discarded.
+                            if block.is_activated() {
+                                info!("kick block {}.", id);
+                                block.process_virtio_queues();
+                            }
                         }
                     }
                     TYPE_NET => {
@@ -432,6 +497,16 @@ impl MMIODeviceManager {
                         // so for Vsock we don't support connection persistence through snapshot.
                         // Any in-flight packets or events are simply lost.
                         // Vsock is restored 'empty'.
+                        // The only reason we still `kick` it is to make guest process
+                        // `TRANSPORT_RESET_EVENT` event we sent during snapshot creation.
+                        let vsock = virtio
+                            .as_mut_any()
+                            .downcast_mut::<Vsock<VsockUnixBackend>>()
+                            .unwrap();
+                        if vsock.is_activated() {
+                            info!("kick vsock {id}.");
+                            vsock.signal_used_queue().unwrap();
+                        }
                     }
                     TYPE_RNG => {
                         let entropy = virtio.as_mut_any().downcast_mut::<Entropy>().unwrap();
@@ -453,7 +528,7 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
         self.addr
     }
     fn irq(&self) -> u32 {
-        self.irqs[0]
+        self.irq.unwrap().into()
     }
     fn length(&self) -> u64 {
         self.len
@@ -462,15 +537,19 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+
     use std::sync::Arc;
 
-    use utils::eventfd::EventFd;
-    use utils::vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
-    use crate::devices::virtio::{ActivateError, Queue, VirtioDevice};
-    use crate::{builder, Vm};
+    use crate::devices::virtio::device::{IrqTrigger, VirtioDevice};
+    use crate::devices::virtio::queue::Queue;
+    use crate::devices::virtio::ActivateError;
+    use crate::test_utils::multi_region_mem;
+    use crate::vstate::kvm::Kvm;
+    use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+    use crate::Vm;
 
     const QUEUE_SIZES: &[u16] = &[64];
 
@@ -479,14 +558,29 @@ mod tests {
             &mut self,
             vm: &VmFd,
             guest_mem: GuestMemoryMmap,
-            device: Arc<Mutex<dyn crate::devices::virtio::VirtioDevice>>,
+            resource_allocator: &mut ResourceAllocator,
+            device: Arc<Mutex<dyn VirtioDevice>>,
             cmdline: &mut kernel_cmdline::Cmdline,
             dev_id: &str,
         ) -> Result<u64, MmioError> {
-            let mmio_device = MmioTransport::new(guest_mem, device);
-            let device_info =
-                self.register_mmio_virtio_for_boot(vm, dev_id.to_string(), mmio_device, cmdline)?;
+            let mmio_device = MmioTransport::new(guest_mem, device, false);
+            let device_info = self.register_mmio_virtio_for_boot(
+                vm,
+                resource_allocator,
+                dev_id.to_string(),
+                mmio_device,
+                cmdline,
+            )?;
             Ok(device_info.addr)
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        /// Gets the number of interrupts used by the devices registered.
+        pub fn used_irqs_count(&self) -> usize {
+            self.get_device_info()
+                .iter()
+                .filter(|(_, device_info)| device_info.irq.is_some())
+                .count()
         }
     }
 
@@ -496,7 +590,7 @@ mod tests {
         dummy: u32,
         queues: Vec<Queue>,
         queue_evts: [EventFd; 1],
-        interrupt_evt: EventFd,
+        interrupt_trigger: IrqTrigger,
     }
 
     impl DummyDevice {
@@ -505,12 +599,12 @@ mod tests {
                 dummy: 0,
                 queues: QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect(),
                 queue_evts: [EventFd::new(libc::EFD_NONBLOCK).expect("cannot create eventFD")],
-                interrupt_evt: EventFd::new(libc::EFD_NONBLOCK).expect("cannot create eventFD"),
+                interrupt_trigger: IrqTrigger::new().expect("cannot create eventFD"),
             }
         }
     }
 
-    impl crate::devices::virtio::VirtioDevice for DummyDevice {
+    impl VirtioDevice for DummyDevice {
         fn avail_features(&self) -> u64 {
             0
         }
@@ -537,12 +631,8 @@ mod tests {
             &self.queue_evts
         }
 
-        fn interrupt_evt(&self) -> &EventFd {
-            &self.interrupt_evt
-        }
-
-        fn interrupt_status(&self) -> Arc<AtomicUsize> {
-            Arc::new(AtomicUsize::new(0))
+        fn interrupt_trigger(&self) -> &IrqTrigger {
+            &self.interrupt_trigger
         }
 
         fn ack_features_by_page(&mut self, page: u32, value: u32) {
@@ -570,64 +660,60 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_arch = "x86_64", allow(unused_mut))]
     fn test_register_virtio_device() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let guest_mem = utils::vm_memory::test_utils::create_anon_guest_memory(
-            &[(start_addr1, 0x1000), (start_addr2, 0x1000)],
-            false,
-        )
-        .unwrap();
-        let mut vm = Vm::new(vec![]).unwrap();
-        vm.memory_init(&guest_mem, false).unwrap();
-        let mut device_manager = MMIODeviceManager::new(
-            0xd000_0000,
-            crate::arch::MMIO_MEM_SIZE,
-            (crate::arch::IRQ_BASE, crate::arch::IRQ_MAX),
-        )
-        .unwrap();
+        let guest_mem = multi_region_mem(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]);
+        let kvm = Kvm::new(vec![]).expect("Cannot create Kvm");
+        let mut vm = Vm::new(&kvm).unwrap();
+        vm.memory_init(&guest_mem).unwrap();
+        let mut device_manager = MMIODeviceManager::new();
+        let mut resource_allocator = ResourceAllocator::new().unwrap();
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096).unwrap();
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
         #[cfg(target_arch = "x86_64")]
-        assert!(builder::setup_interrupt_controller(&mut vm).is_ok());
+        vm.setup_irqchip().unwrap();
         #[cfg(target_arch = "aarch64")]
-        assert!(builder::setup_interrupt_controller(&mut vm, 1).is_ok());
+        vm.setup_irqchip(1).unwrap();
 
-        assert!(device_manager
-            .register_virtio_test_device(vm.fd(), guest_mem, dummy, &mut cmdline, "dummy")
-            .is_ok());
+        device_manager
+            .register_virtio_test_device(
+                vm.fd(),
+                guest_mem,
+                &mut resource_allocator,
+                dummy,
+                &mut cmdline,
+                "dummy",
+            )
+            .unwrap();
     }
 
     #[test]
+    #[cfg_attr(target_arch = "x86_64", allow(unused_mut))]
     fn test_register_too_many_devices() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let guest_mem = utils::vm_memory::test_utils::create_anon_guest_memory(
-            &[(start_addr1, 0x1000), (start_addr2, 0x1000)],
-            false,
-        )
-        .unwrap();
-        let mut vm = Vm::new(vec![]).unwrap();
-        vm.memory_init(&guest_mem, false).unwrap();
-        let mut device_manager = MMIODeviceManager::new(
-            0xd000_0000,
-            crate::arch::MMIO_MEM_SIZE,
-            (crate::arch::IRQ_BASE, crate::arch::IRQ_MAX),
-        )
-        .unwrap();
+        let guest_mem = multi_region_mem(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]);
+        let kvm = Kvm::new(vec![]).expect("Cannot create Kvm");
+        let mut vm = Vm::new(&kvm).unwrap();
+        vm.memory_init(&guest_mem).unwrap();
+        let mut device_manager = MMIODeviceManager::new();
+        let mut resource_allocator = ResourceAllocator::new().unwrap();
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096).unwrap();
         #[cfg(target_arch = "x86_64")]
-        assert!(builder::setup_interrupt_controller(&mut vm).is_ok());
+        vm.setup_irqchip().unwrap();
         #[cfg(target_arch = "aarch64")]
-        assert!(builder::setup_interrupt_controller(&mut vm, 1).is_ok());
+        vm.setup_irqchip(1).unwrap();
 
         for _i in crate::arch::IRQ_BASE..=crate::arch::IRQ_MAX {
             device_manager
                 .register_virtio_test_device(
                     vm.fd(),
                     guest_mem.clone(),
+                    &mut resource_allocator,
                     Arc::new(Mutex::new(DummyDevice::new())),
                     &mut cmdline,
                     "dummy1",
@@ -641,6 +727,7 @@ mod tests {
                     .register_virtio_test_device(
                         vm.fd(),
                         guest_mem,
+                        &mut resource_allocator,
                         Arc::new(Mutex::new(DummyDevice::new())),
                         &mut cmdline,
                         "dummy2"
@@ -660,37 +747,38 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_arch = "x86_64", allow(unused_mut))]
     fn test_device_info() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let guest_mem = utils::vm_memory::test_utils::create_anon_guest_memory(
-            &[(start_addr1, 0x1000), (start_addr2, 0x1000)],
-            false,
-        )
-        .unwrap();
-        let mut vm = Vm::new(vec![]).unwrap();
-        vm.memory_init(&guest_mem, false).unwrap();
+        let guest_mem = multi_region_mem(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]);
+        let kvm = Kvm::new(vec![]).expect("Cannot create Kvm");
+        let mut vm = Vm::new(&kvm).unwrap();
+        vm.memory_init(&guest_mem).unwrap();
 
         let mem_clone = guest_mem.clone();
 
         #[cfg(target_arch = "x86_64")]
-        assert!(builder::setup_interrupt_controller(&mut vm).is_ok());
+        vm.setup_irqchip().unwrap();
         #[cfg(target_arch = "aarch64")]
-        assert!(builder::setup_interrupt_controller(&mut vm, 1).is_ok());
+        vm.setup_irqchip(1).unwrap();
 
-        let mut device_manager = MMIODeviceManager::new(
-            0xd000_0000,
-            crate::arch::MMIO_MEM_SIZE,
-            (crate::arch::IRQ_BASE, crate::arch::IRQ_MAX),
-        )
-        .unwrap();
+        let mut device_manager = MMIODeviceManager::new();
+        let mut resource_allocator = ResourceAllocator::new().unwrap();
         let mut cmdline = kernel_cmdline::Cmdline::new(4096).unwrap();
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
         let type_id = dummy.lock().unwrap().device_type();
         let id = String::from("foo");
         let addr = device_manager
-            .register_virtio_test_device(vm.fd(), guest_mem, dummy, &mut cmdline, &id)
+            .register_virtio_test_device(
+                vm.fd(),
+                guest_mem,
+                &mut resource_allocator,
+                dummy,
+                &mut cmdline,
+                &id,
+            )
             .unwrap();
         assert!(device_manager
             .get_device(DeviceType::Virtio(type_id), &id)
@@ -701,7 +789,10 @@ mod tests {
         );
         assert_eq!(
             crate::arch::IRQ_BASE,
-            device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id)].irqs[0]
+            device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id)]
+                .irq
+                .unwrap()
+                .get()
         );
 
         let id = "bar";
@@ -712,7 +803,14 @@ mod tests {
         let dummy2 = Arc::new(Mutex::new(DummyDevice::new()));
         let id2 = String::from("foo2");
         device_manager
-            .register_virtio_test_device(vm.fd(), mem_clone, dummy2, &mut cmdline, &id2)
+            .register_virtio_test_device(
+                vm.fd(),
+                mem_clone,
+                &mut resource_allocator,
+                dummy2,
+                &mut cmdline,
+                &id2,
+            )
             .unwrap();
 
         let mut count = 0;
@@ -731,41 +829,39 @@ mod tests {
     }
 
     #[test]
-    fn test_slot_irq_allocation() {
-        let mut device_manager = MMIODeviceManager::new(
-            0xd000_0000,
-            crate::arch::MMIO_MEM_SIZE,
-            (crate::arch::IRQ_BASE, crate::arch::IRQ_MAX),
-        )
-        .unwrap();
-        let device_info = device_manager.allocate_mmio_resources(0).unwrap();
-        assert_eq!(device_info.irqs.len(), 0);
-        let device_info = device_manager.allocate_mmio_resources(1).unwrap();
-        assert_eq!(device_info.irqs[0], crate::arch::IRQ_BASE);
+    fn test_no_irq_allocation() {
+        let mut device_manager = MMIODeviceManager::new();
+        let mut resource_allocator = ResourceAllocator::new().unwrap();
+
+        let device_info = device_manager
+            .allocate_mmio_resources(&mut resource_allocator, 0)
+            .unwrap();
+        assert!(device_info.irq.is_none());
+    }
+
+    #[test]
+    fn test_irq_allocation() {
+        let mut device_manager = MMIODeviceManager::new();
+        let mut resource_allocator = ResourceAllocator::new().unwrap();
+
+        let device_info = device_manager
+            .allocate_mmio_resources(&mut resource_allocator, 1)
+            .unwrap();
+        assert_eq!(device_info.irq.unwrap().get(), crate::arch::IRQ_BASE);
+    }
+
+    #[test]
+    fn test_allocation_failure() {
+        let mut device_manager = MMIODeviceManager::new();
+        let mut resource_allocator = ResourceAllocator::new().unwrap();
         assert_eq!(
             format!(
                 "{}",
                 device_manager
-                    .allocate_mmio_resources(crate::arch::IRQ_MAX - crate::arch::IRQ_BASE + 1)
+                    .allocate_mmio_resources(&mut resource_allocator, 2)
                     .unwrap_err()
             ),
-            "Failed to allocate requested resource: The requested resource is not available."
-                .to_string()
+            "Invalid MMIO IRQ configuration.".to_string()
         );
-
-        for i in crate::arch::IRQ_BASE..crate::arch::IRQ_MAX {
-            device_manager.irq_allocator.free_id(i).unwrap();
-        }
-
-        let device_info = device_manager
-            .allocate_mmio_resources(crate::arch::IRQ_MAX - crate::arch::IRQ_BASE - 1)
-            .unwrap();
-        assert_eq!(device_info.irqs[16], crate::arch::IRQ_BASE + 16);
-        assert_eq!(
-            format!("{}", device_manager.allocate_mmio_resources(2).unwrap_err()),
-            "Failed to allocate requested resource: The requested resource is not available."
-                .to_string()
-        );
-        assert!(device_manager.allocate_mmio_resources(0).is_ok());
     }
 }

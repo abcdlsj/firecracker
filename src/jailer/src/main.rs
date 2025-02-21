@@ -3,13 +3,14 @@
 
 use std::ffi::{CString, NulError, OsString};
 use std::fmt::{Debug, Display};
-use std::os::unix::prelude::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::{env as p_env, fs, io};
 
-use utils::arg_parser::{ArgParser, Argument, Error as ParsingError};
-use utils::syscall::SyscallReturnCode;
+use env::PROC_MOUNTS;
+use utils::arg_parser::{ArgParser, Argument, UtilsArgParserError as ParsingError};
+use utils::time::{get_time_us, ClockType};
 use utils::validators;
+use vmm_sys_util::syscall::SyscallReturnCode;
 
 use crate::env::Env;
 
@@ -32,8 +33,6 @@ pub enum JailerError {
     CgroupLineNotFound(String, String),
     #[error("Cgroup invalid file: {0}")]
     CgroupInvalidFile(String),
-    #[error("Expected value {0} for {2}. Current value: {1}")]
-    CgroupWrite(String, String, String),
     #[error("Invalid format for cgroups: {0}")]
     CgroupFormat(String),
     #[error("Hierarchy not found: {0}")]
@@ -44,11 +43,13 @@ pub enum JailerError {
     CgroupInvalidVersion(String),
     #[error("Parent cgroup path is invalid. Path should not be absolute or contain '..' or '.'")]
     CgroupInvalidParentPath(),
-    #[error("Failed to change owner for {0:?}: {1}")]
+    #[error("Failed to write to cgroups file: {0}")]
+    CgroupWrite(io::Error),
+    #[error("Failed to change owner for {0}: {1}")]
     ChangeFileOwner(PathBuf, io::Error),
     #[error("Failed to chdir into chroot directory: {0}")]
     ChdirNewRoot(io::Error),
-    #[error("Failed to change permissions on {0:?}: {1}")]
+    #[error("Failed to change permissions on {0}: {1}")]
     Chmod(PathBuf, io::Error),
     #[error("Failed cloning into a new child process: {0}")]
     Clone(io::Error),
@@ -64,6 +65,8 @@ pub enum JailerError {
     CreateDir(PathBuf, io::Error),
     #[error("Encountered interior \\0 while parsing a string")]
     CStringParsing(NulError),
+    #[error("Failed to daemonize: {0}")]
+    Daemonize(io::Error),
     #[error("Failed to open directory {0}: {1}")]
     DirOpen(String, String),
     #[error("Failed to duplicate fd: {0}")]
@@ -82,16 +85,20 @@ pub enum JailerError {
     FromBytesWithNul(std::ffi::FromBytesWithNulError),
     #[error("Failed to get flags from fd: {0}")]
     GetOldFdFlags(io::Error),
+    #[error("Failed to get PID (getpid): {0}")]
+    GetPid(io::Error),
+    #[error("Failed to get SID (getsid): {0}")]
+    GetSid(io::Error),
     #[error("Invalid gid: {0}")]
     Gid(String),
     #[error("Invalid instance ID: {0}")]
-    InvalidInstanceId(validators::Error),
+    InvalidInstanceId(validators::ValidatorError),
     #[error("{}", format!("File {:?} doesn't have a parent", .0).replace('\"', ""))]
     MissingParent(PathBuf),
     #[error("Failed to create the jail root directory before pivoting root: {0}")]
     MkdirOldRoot(io::Error),
     #[error("Failed to create {1} via mknod inside the jail: {0}")]
-    MknodDev(io::Error, &'static str),
+    MknodDev(io::Error, String),
     #[error("Failed to bind mount the jail root directory: {0}")]
     MountBind(io::Error),
     #[error("Failed to change the propagation type to slave: {0}")]
@@ -110,7 +117,7 @@ pub enum JailerError {
     ReadLine(PathBuf, io::Error),
     #[error("{}", format!("Failed to read file {:?} into a string: {}", .0, .1).replace('\"', ""))]
     ReadToString(PathBuf, io::Error),
-    #[error("Regex failed: {0:?}")]
+    #[error("Regex failed: {0}")]
     RegEx(regex::Error),
     #[error("Invalid resource argument: {0}")]
     ResLimitArgument(String),
@@ -254,49 +261,15 @@ fn close_fds_by_close_range() -> Result<(), JailerError> {
             libc::c_uint::MAX,
             libc::CLOSE_RANGE_UNSHARE,
         )
-    } as libc::c_int)
+    })
     .into_empty_result()
     .map_err(JailerError::CloseRange)
 }
 
-fn close_fds_by_reading_proc() -> Result<(), JailerError> {
-    // Calling this method means that close_range failed (we might be on kernel < 5.9).
-    // We can't use std::fs::ReadDir here as under the hood we need access to the dirfd in order to
-    // not close it twice
-    let path = "/proc/self/fd";
-    let mut dir = nix::dir::Dir::open(
-        path,
-        nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOATIME,
-        nix::sys::stat::Mode::empty(),
-    )
-    .map_err(|e| JailerError::DirOpen(path.to_string(), e.to_string()))?;
-
-    let dirfd = dir.as_raw_fd();
-    let mut c = dir.iter();
-
-    while let Some(Ok(path)) = c.next() {
-        let file_name = path.file_name();
-        let fd_str = file_name.to_str().map_err(JailerError::UTF8Parsing)?;
-
-        // If the entry is an INT entry, we go ahead and we treat it as an FD identifier.
-        if let Ok(fd) = fd_str.parse::<i32>() {
-            if fd > 2 && fd != dirfd {
-                // SAFETY: Safe because close() cannot fail when passed a valid parameter.
-                unsafe { libc::close(fd) };
-            }
-        }
-    }
-    Ok(())
-}
-
 // Closes all FDs other than 0 (STDIN), 1 (STDOUT) and 2 (STDERR)
 fn close_inherited_fds() -> Result<(), JailerError> {
-    // The approach we take here is to firstly try to use the close_range syscall
-    // which is available on kernels > 5.9.
-    // We then fallback to using /proc/sef/fd to close open fds.
-    if close_fds_by_close_range().is_err() {
-        close_fds_by_reading_proc()?;
-    }
+    // We use the close_range syscall which is available on kernels > 5.9.
+    close_fds_by_close_range()?;
     Ok(())
 }
 
@@ -319,7 +292,7 @@ fn clean_env_vars() {
     }
 }
 
-/// Turns an AsRef<Path> into a CString (c style string).
+/// Turns an [`AsRef<Path>`] into a [`CString`] (c style string).
 /// The expect should not fail, since Linux paths only contain valid Unicode chars (do they?),
 /// and do not contain null bytes (do they?).
 pub fn to_cstring<T: AsRef<Path> + Debug>(path: T) -> Result<CString, JailerError> {
@@ -366,8 +339,9 @@ fn main_exec() -> Result<(), JailerError> {
 
     Env::new(
         arguments,
-        utils::time::get_time_us(utils::time::ClockType::Monotonic),
-        utils::time::get_time_us(utils::time::ClockType::ProcessCpu),
+        get_time_us(ClockType::Monotonic),
+        get_time_us(ClockType::ProcessCpu),
+        PROC_MOUNTS,
     )
     .and_then(|env| {
         fs::create_dir_all(env.chroot_dir())
@@ -387,7 +361,7 @@ mod tests {
     use std::fs::File;
     use std::os::unix::io::IntoRawFd;
 
-    use utils::rand;
+    use vmm_sys_util::rand;
 
     use super::*;
 
@@ -398,23 +372,22 @@ mod tests {
             "/tmp/jailer/tests/close_fds/_{}",
             rand::rand_alphanumerics(4).into_string().unwrap()
         );
-        assert!(fs::create_dir_all(&tmp_dir_path).is_ok());
+        fs::create_dir_all(&tmp_dir_path).unwrap();
 
         let mut fds = Vec::new();
         for i in 0..n {
             let maybe_file = File::create(format!("{}/{}", &tmp_dir_path, i));
-            assert!(maybe_file.is_ok());
             fds.push(maybe_file.unwrap().into_raw_fd());
         }
 
-        assert!(test_fn().is_ok());
+        test_fn().unwrap();
 
         for fd in fds {
             let is_fd_opened = unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0;
             assert!(!is_fd_opened);
         }
 
-        assert!(fs::remove_dir_all(tmp_dir_path).is_ok());
+        fs::remove_dir_all(tmp_dir_path).unwrap();
     }
 
     #[test]
@@ -436,11 +409,6 @@ mod tests {
         if major > 5 || (major == 5 && minor >= 9) {
             run_close_fds_test(close_fds_by_close_range);
         }
-    }
-
-    #[test]
-    fn test_fds_proc() {
-        run_close_fds_test(close_fds_by_reading_proc);
     }
 
     #[test]

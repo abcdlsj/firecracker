@@ -5,7 +5,7 @@ use crate::cpu_config::x86_64::cpuid::{
     cpuid, CpuidEntry, CpuidKey, CpuidRegisters, CpuidTrait, KvmCpuidFlags,
 };
 
-/// Error type for [`Cpuid::normalize`].
+/// Error type for [`super::Cpuid::normalize`].
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, thiserror::Error, displaydoc::Display, Eq, PartialEq)]
 pub enum NormalizeCpuidError {
@@ -57,10 +57,10 @@ pub enum GetMaxCpusPerPackageError {
 }
 
 /// Error type for setting leaf b section of `IntelCpuid::normalize`.
+#[rustfmt::skip]
 #[derive(Debug, thiserror::Error, displaydoc::Display, Eq, PartialEq)]
 pub enum ExtendedTopologyError {
-    #[rustfmt::skip]
-    #[doc = "Failed to set `Number of bits to shift right on x2APIC ID to get a unique topology ID of the next level type`: {0}"]
+    /// Failed to set `Number of bits to shift right on x2APIC ID to get a unique topology ID of the next level type`: {0}
     ApicId(CheckedAssignError),
     /// Failed to set `Number of logical processors at this level type`: {0}
     LogicalProcessors(CheckedAssignError),
@@ -87,14 +87,14 @@ pub enum ExtendedCacheFeaturesError {
 pub struct CheckedAssignError;
 
 /// Sets a given bit to a true or false (1 or 0).
-#[allow(clippy::integer_arithmetic, clippy::arithmetic_side_effects)]
+#[allow(clippy::arithmetic_side_effects)]
 pub fn set_bit(x: &mut u32, bit: u8, y: bool) {
     debug_assert!(bit < 32);
     *x = (*x & !(1 << bit)) | ((u32::from(u8::from(y))) << bit);
 }
 
 /// Sets a given range to a given value.
-#[allow(clippy::integer_arithmetic, clippy::arithmetic_side_effects)]
+#[allow(clippy::arithmetic_side_effects)]
 pub fn set_range(
     x: &mut u32,
     range: std::ops::Range<u8>,
@@ -120,7 +120,7 @@ pub fn set_range(
     }
 }
 /// Gets a given range within a given value.
-#[allow(clippy::integer_arithmetic, clippy::arithmetic_side_effects)]
+#[allow(clippy::arithmetic_side_effects)]
 pub fn get_range(x: u32, range: std::ops::Range<u8>) -> u32 {
     debug_assert!(range.end >= range.start);
     (x & mask(range.clone())) >> range.start
@@ -129,7 +129,6 @@ pub fn get_range(x: u32, range: std::ops::Range<u8>) -> u32 {
 /// Returns a mask where the given range is ones.
 #[allow(
     clippy::as_conversions,
-    clippy::integer_arithmetic,
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation
 )]
@@ -166,8 +165,8 @@ impl super::Cpuid {
     /// # Errors
     ///
     /// When:
-    /// - [`IntelCpuid::normalize`] errors.
-    /// - [`AmdCpuid::normalize`] errors.
+    /// - [`super::IntelCpuid::normalize`] errors.
+    /// - [`super::AmdCpuid::normalize`] errors.
     // As we pass through host frequency, we require CPUID and thus `cfg(cpuid)`.
     #[inline]
     pub fn normalize(
@@ -584,7 +583,7 @@ mod tests {
             cpu_bits,
             cpus_per_core,
         );
-        assert!(result.is_ok());
+        result.unwrap();
         assert!(intel_cpuid.inner().contains_key(&CpuidKey {
             leaf: 0xb,
             subleaf: 0x1
@@ -608,7 +607,7 @@ mod tests {
         )])));
         let result =
             amd_cpuid.update_extended_topology_entry(cpu_index, cpu_count, cpu_bits, cpus_per_core);
-        assert!(result.is_ok());
+        result.unwrap();
         assert!(amd_cpuid.inner().contains_key(&CpuidKey {
             leaf: 0xb,
             subleaf: 0x1

@@ -25,15 +25,15 @@ the Linux Kernel Virtual Machine (KVM) to create and run microVMs. Firecracker
 has a minimalist design. It excludes unnecessary devices and guest-facing
 functionality to reduce the memory footprint and attack surface area of each
 microVM. This improves security, decreases the startup time, and increases
-hardware utilization. Firecracker has also been integrated in container runtimes,
-for example
-[Kata Containers](https://github.com/kata-containers/documentation/wiki/Initial-release-of-Kata-Containers-with-Firecracker-support)
-and [Weaveworks Ignite](https://github.com/weaveworks/ignite).
+hardware utilization. Firecracker has also been integrated in container
+runtimes, for example
+[Kata Containers](https://github.com/kata-containers/kata-containers) and
+[Flintlock](https://github.com/liquidmetal-dev/flintlock).
 
 Firecracker was developed at Amazon Web Services to accelerate the speed and
 efficiency of services like [AWS Lambda](https://aws.amazon.com/lambda/) and
-[AWS Fargate](https://aws.amazon.com/fargate/). Firecracker is open
-sourced under [Apache version 2.0](LICENSE).
+[AWS Fargate](https://aws.amazon.com/fargate/). Firecracker is open sourced
+under [Apache version 2.0](LICENSE).
 
 To read more about Firecracker, check out
 [firecracker-microvm.io](https://firecracker-microvm.github.io).
@@ -44,8 +44,8 @@ To get started with Firecracker, download the latest
 [release](https://github.com/firecracker-microvm/firecracker/releases) binaries
 or build it from source.
 
-You can build Firecracker on any Unix/Linux system that has Docker running
-(we use a development container) and `bash` installed, as follows:
+You can build Firecracker on any Unix/Linux system that has Docker running (we
+use a development container) and `bash` installed, as follows:
 
 ```bash
 git clone https://github.com/firecracker-microvm/firecracker
@@ -92,8 +92,8 @@ Firecracker's overall architecture is described in
 
 Firecracker consists of a single micro Virtual Machine Manager process that
 exposes an API endpoint to the host once started. The API is
-[specified in OpenAPI format](src/api_server/swagger/firecracker.yaml). Read more
-about it in the [API docs](docs/api_requests).
+[specified in OpenAPI format](src/firecracker/swagger/firecracker.yaml). Read
+more about it in the [API docs](docs/api_requests).
 
 The **API endpoint** can be used to:
 
@@ -123,30 +123,26 @@ The **API endpoint** can be used to:
 - Demand fault paging and CPU oversubscription enabled by default.
 - Advanced, thread-specific seccomp filters for enhanced security.
 - [Jailer](docs/jailer.md) process for starting Firecracker in production
-  scenarios; applies a cgroup/namespace isolation barrier and then
-  drops privileges.
+  scenarios; applies a cgroup/namespace isolation barrier and then drops
+  privileges.
 
 ## Tested platforms
 
 We test all combinations of:
 
-| Instance   | Host OS & Kernel   | Guest Rootfs   | Guest Kernel   |
-| :--------- | :----------------- | :------------- | :------------- |
-| m5d.metal  | al2    linux_4.1   | ubuntu 18.04   | linux_4.14     |
-| m6i.metal  | al2    linux_5.10  |                | linux_5.10     |
-| m6a.metal  |                    |                |                |
-| m6g.metal  |                    |                |                |
-| c7g.metal  |                    |                |                |
+| Instance  | Host OS & Kernel | Guest Rootfs | Guest Kernel |
+| :-------- | :--------------- | :----------- | :----------- |
+| c5n.metal | al2 linux_5.10   | ubuntu 24.04 | linux_5.10   |
+| m5n.metal | al2023 linux_6.1 |              | linux_6.1    |
+| m6i.metal |                  |              |              |
+| m6a.metal |                  |              |              |
+| m6g.metal |                  |              |              |
+| m7g.metal |                  |              |              |
 
 ## Known issues and Limitations
 
-- The [SendCtrlAltDel](docs/api_requests/actions.md#sendctrlaltdel) API request
-  is not supported for aarch64 enabled microVMs.
-- If a CPU template is not used on x86_64, overwrites of `MSR_IA32_TSX_CTRL` MSR
-  value will not be preserved after restoring from a snapshot.
 - The `pl031` RTC device on aarch64 does not support interrupts, so guest
   programs which use an RTC alarm (e.g. `hwclock`) will not work.
-- Issues and limitations related to snapshots are described in a [separate document](docs/snapshotting/snapshot-support.md#limitations).
 
 ## Performance
 
@@ -160,8 +156,8 @@ testing.
 
 The security of Firecracker is our top priority. If you suspect you have
 uncovered a vulnerability, contact us privately, as outlined in our
-[security policy document](SECURITY.md); we will immediately prioritize
-your disclosure.
+[security policy document](SECURITY.md); we will immediately prioritize your
+disclosure.
 
 ## FAQ & Contact
 
@@ -171,7 +167,7 @@ You can get in touch with the Firecracker community in the following ways:
 
 - Security-related issues, see our [security policy document](SECURITY.md).
 - Chat with us on our
-  [Slack workspace](https://join.slack.com/t/firecracker-microvm/shared_invite/zt-1zlb87h4z-NED1rBhVqOQ1ygBgT76wlg)
+  [Slack workspace](https://join.slack.com/t/firecracker-microvm/shared_invite/zt-2tc0mfxpc-tU~HYAYSzLDl5XGGJU3YIg)
   _Note: most of the maintainers are on a European time zone._
 - Open a GitHub issue in this repository.
 - Email the maintainers at

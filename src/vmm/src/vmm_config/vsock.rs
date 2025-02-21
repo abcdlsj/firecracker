@@ -6,16 +6,16 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::devices::virtio::{Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError};
+use crate::devices::virtio::vsock::{Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError};
 
 type MutexVsockUnix = Arc<Mutex<Vsock<VsockUnixBackend>>>;
 
 /// Errors associated with `NetworkInterfaceConfig`.
 #[derive(Debug, derive_more::From, thiserror::Error, displaydoc::Display)]
 pub enum VsockConfigError {
-    /// Cannot create backend for vsock device: {0:?}
+    /// Cannot create backend for vsock device: {0}
     CreateVsockBackend(VsockUnixBackendError),
-    /// Cannot create vsock device: {0:?}
+    /// Cannot create vsock device: {0}
     CreateVsockDevice(VsockError),
 }
 
@@ -112,7 +112,7 @@ impl VsockBuilder {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use utils::tempfile::TempFile;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;

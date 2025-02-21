@@ -4,19 +4,19 @@
 
 from pathlib import Path
 
-from openapi_spec_validator import validate_spec
+from openapi_spec_validator import validate
 from openapi_spec_validator.readers import read_from_filename
 
 
 def validate_swagger(swagger_spec):
     """Fail if OpenAPI spec is not followed."""
     spec_dict, _ = read_from_filename(swagger_spec)
-    validate_spec(spec_dict)
+    validate(spec_dict)
 
 
 def test_firecracker_swagger():
     """
     Test that Firecracker swagger specification is valid.
     """
-    swagger_spec = Path("../src/api_server/swagger/firecracker.yaml")
+    swagger_spec = Path("../src/firecracker/swagger/firecracker.yaml")
     validate_swagger(swagger_spec)

@@ -52,7 +52,7 @@ pub struct MuxerKillQ {
 }
 
 impl MuxerKillQ {
-    const SIZE: usize = defs::MUXER_KILLQ_SIZE;
+    const SIZE: usize = defs::MUXER_KILLQ_SIZE as usize;
 
     /// Trivial kill queue constructor.
     pub fn new() -> Self {
@@ -106,7 +106,7 @@ impl MuxerKillQ {
     pub fn pop(&mut self) -> Option<ConnMapKey> {
         if let Some(item) = self.q.front() {
             if Instant::now() > item.kill_time {
-                return Some(self.q.pop_front().unwrap().key);
+                return self.q.pop_front().map(|entry| entry.key);
             }
         }
         None

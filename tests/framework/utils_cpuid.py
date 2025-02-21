@@ -7,8 +7,10 @@ import re
 import subprocess
 from enum import Enum, auto
 
-from framework.utils import run_cmd
+from framework.utils import check_output
 from framework.utils_imdsv2 import imdsv2_get
+
+CPU_FEATURES_CMD = r"lscpu |grep -oP '^Flags:\s+\K.+'"
 
 
 class CpuVendor(Enum):
@@ -19,15 +21,26 @@ class CpuVendor(Enum):
     ARM = auto()
 
 
+class CpuModel(str, Enum):
+    """CPU models"""
+
+    AMD_MILAN = "AMD_MILAN"
+    AMD_GENOA = "AMD_GENOA"
+    ARM_NEOVERSE_N1 = "ARM_NEOVERSE_N1"
+    ARM_NEOVERSE_V1 = "ARM_NEOVERSE_V1"
+    INTEL_SKYLAKE = "INTEL_SKYLAKE"
+    INTEL_CASCADELAKE = "INTEL_CASCADELAKE"
+    INTEL_ICELAKE = "INTEL_ICELAKE"
+
+
 CPU_DICT = {
     CpuVendor.INTEL: {
         "Intel(R) Xeon(R) Platinum 8175M CPU": "INTEL_SKYLAKE",
+        "Intel(R) Xeon(R) Platinum 8124M CPU": "INTEL_SKYLAKE",
         "Intel(R) Xeon(R) Platinum 8259CL CPU": "INTEL_CASCADELAKE",
         "Intel(R) Xeon(R) Platinum 8375C CPU": "INTEL_ICELAKE",
     },
-    CpuVendor.AMD: {
-        "AMD EPYC 7R13": "AMD_MILAN",
-    },
+    CpuVendor.AMD: {"AMD EPYC 7R13": "AMD_MILAN", "AMD EPYC 9R14": "AMD_GENOA"},
     CpuVendor.ARM: {"0xd0c": "ARM_NEOVERSE_N1", "0xd40": "ARM_NEOVERSE_V1"},
 }
 
@@ -46,9 +59,9 @@ def get_cpu_vendor():
 def get_cpu_model_name():
     """Return the CPU model name."""
     if platform.machine() == "aarch64":
-        _, stdout, _ = run_cmd("cat /proc/cpuinfo | grep 'CPU part' | uniq")
+        _, stdout, _ = check_output("cat /proc/cpuinfo | grep 'CPU part' | uniq")
     else:
-        _, stdout, _ = run_cmd("cat /proc/cpuinfo | grep 'model name' | uniq")
+        _, stdout, _ = check_output("cat /proc/cpuinfo | grep 'model name' | uniq")
     info = stdout.strip().split(sep=":")
     assert len(info) == 2
     raw_cpu_model = info[1].strip()

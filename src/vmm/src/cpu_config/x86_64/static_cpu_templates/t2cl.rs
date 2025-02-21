@@ -13,9 +13,9 @@ use crate::cpu_config::x86_64::custom_cpu_template::{
 /// instruction set feature partity with AMD Milan using T2A template.
 ///
 /// References:
-/// - Intel SDM: https://cdrdv2.intel.com/v1/dl/getContent/671200
-/// - AMD APM: https://www.amd.com/system/files/TechDocs/40332.pdf
-/// - CPUID Enumeration and Architectural MSRs: https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/cpuid-enumeration-and-architectural-msrs.html
+/// - Intel SDM: <https://cdrdv2.intel.com/v1/dl/getContent/671200>
+/// - AMD APM: <https://www.amd.com/system/files/TechDocs/40332.pdf>
+/// - CPUID Enumeration and Architectural MSRs: <https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/cpuid-enumeration-and-architectural-msrs.html>
 #[allow(clippy::unusual_byte_groupings)]
 pub fn t2cl() -> CustomCpuTemplate {
     CustomCpuTemplate {
@@ -260,7 +260,7 @@ pub fn t2cl() -> CustomCpuTemplate {
             // by making the most use of available mitigations on the processor. Thus, T2CL template
             // passes through security mitigation bits that KVM thinks are able to be passed
             // through. The list of such bits are found in the following link.
-            // https://elixir.bootlin.com/linux/v6.1.46/source/arch/x86/kvm/x86.c#L1600
+            // https://elixir.bootlin.com/linux/v6.8.2/source/arch/x86/kvm/x86.c#L1621
             // - Bit 00: RDCL_NO
             // - Bit 01: IBRS_ALL
             // - Bit 02: RSBA
@@ -277,12 +277,14 @@ pub fn t2cl() -> CustomCpuTemplate {
             // - Bit 19: RRSBA
             // - Bit 24: PBRSB_NO
             // - Bit 26: GDS_NO
+            // - Bit 27: RFDS_NO
+            // - Bit 28: RFDS_CLEAR
             //
             // Note that this MSR is specific to Intel processors.
             RegisterModifier {
                 addr: 0x10a,
                 bitmap: RegisterValueFilter {
-                    filter: 0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1010_1111_0101_0001_1110_0000_0000,
+                    filter: 0b1111_1111_1111_1111_1111_1111_1111_1111_1110_0010_1111_0101_0001_1110_0000_0000,
                     value: 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000,
                 },
             },

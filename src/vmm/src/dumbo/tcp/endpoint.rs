@@ -37,7 +37,7 @@ const CONNECTION_RTO_COUNT_MAX: u16 = 15;
 // imaginable regular MMDS requests.
 // TODO: Maybe at some point include this in the checks we do when populating the MMDS via the API,
 // since it effectively limits the size of the keys (URIs) we're willing to use.
-const RCV_BUF_MAX_SIZE: usize = 2500;
+const RCV_BUF_MAX_SIZE: u32 = 2500;
 
 // Represents the local endpoint of a HTTP over TCP connection which carries GET requests
 // to the MMDS.
@@ -45,7 +45,7 @@ const RCV_BUF_MAX_SIZE: usize = 2500;
 pub struct Endpoint {
     // A fixed size buffer used to store bytes received via TCP. If the current request does not
     // fit within, we reset the connection, since we see this as a hard memory bound.
-    receive_buf: [u8; RCV_BUF_MAX_SIZE],
+    receive_buf: [u8; RCV_BUF_MAX_SIZE as usize],
     // Represents the next available position in the buffer.
     receive_buf_left: usize,
     // This is filled with the HTTP response bytes after we parse a request and generate the reply.
@@ -81,25 +81,38 @@ pub struct Endpoint {
 // is the only option).
 
 impl Endpoint {
+    /// Creates a new Endpoint from a [`crate::tcp::connection::Connection`]
+    /// ## Arguments:
+    /// - `segment`: The incoming `SYN`.
+    /// - `eviction_threshold`: CPU cycles that must elapse before this Endpoint is evictable
+    /// - `connection_rto_period`: How long the connection waits before a retransmission timeout
+    ///   fires for the first segment which has not been acknowledged yet. This uses an opaque time
+    ///   unit.
+    /// - `connection_rto_count_max`: How many consecutive timeout-based retransmission may occur
+    ///   before the connection resets itself.
+    /// ## Panics:
+    /// - `assert!(RCV_BUF_MAX_SIZE <= MAX_WINDOW_SIZE as usize);`
     pub fn new<T: NetworkBytes + Debug>(
         segment: &TcpSegment<T>,
         eviction_threshold: NonZeroU64,
         connection_rto_period: NonZeroU64,
         connection_rto_count_max: NonZeroU16,
     ) -> Result<Self, PassiveOpenError> {
-        // TODO: mention this in doc comment for function
         // This simplifies things, and is a very reasonable assumption.
-        assert!(RCV_BUF_MAX_SIZE <= MAX_WINDOW_SIZE as usize);
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(RCV_BUF_MAX_SIZE <= MAX_WINDOW_SIZE);
+        }
 
         let connection = Connection::passive_open(
             segment,
-            RCV_BUF_MAX_SIZE as u32,
+            RCV_BUF_MAX_SIZE,
             connection_rto_period,
             connection_rto_count_max,
         )?;
 
         Ok(Endpoint {
-            receive_buf: [0u8; RCV_BUF_MAX_SIZE],
+            receive_buf: [0u8; RCV_BUF_MAX_SIZE as usize],
             receive_buf_left: 0,
             response_buf: Vec::new(),
             // TODO: Using first_not_sent() makes sense here because a connection is currently
@@ -168,9 +181,12 @@ impl Endpoint {
             self.receive_buf_left += len.get();
         };
 
+        // The unwrap here should be safe because we assert the size whenever we append to
+        // response_buf.
         if !self.response_buf.is_empty()
             && self.connection.highest_ack_received()
-                == self.initial_response_seq + Wrapping(self.response_buf.len() as u32)
+                == self.initial_response_seq
+                    + Wrapping(u32::try_from(self.response_buf.len()).unwrap())
         {
             // If we got here, then we still have some response bytes to send (which are
             // stored in self.response_buf).
@@ -217,12 +233,12 @@ impl Endpoint {
                         // We have to remove the bytes up to end from receive_buf, by shifting the
                         // others to the beginning of the buffer, and updating receive_buf_left.
                         // Also, advance the rwnd edge of the inner connection.
-                        // TODO: Maximum efficiency.
-                        for j in 0..b.len() - end {
-                            b[j] = b[j + end];
-                        }
+                        b.copy_within(end.., 0);
                         self.receive_buf_left -= end;
-                        self.connection.advance_local_rwnd_edge(end as u32);
+                        // Safe to unwrap because we assert that the response buffer is small
+                        // enough.
+                        self.connection
+                            .advance_local_rwnd_edge(u32::try_from(end).unwrap());
                         break;
                     }
                 }
@@ -265,9 +281,8 @@ impl Endpoint {
             tcp_payload_src,
             timestamp_cycles(),
         ) {
-            Ok(write_result) => write_result.map(|segment| {
-                self.response_seq += Wrapping(segment.inner().payload_len() as u32);
-                segment
+            Ok(write_result) => write_result.inspect(|segment| {
+                self.response_seq += Wrapping(u32::from(segment.inner().payload_len()));
             }),
             Err(_) => {
                 METRICS.mmds.tx_errors.inc();
@@ -370,7 +385,7 @@ mod tests {
         let mut buf1 = [0u8; 500];
         let mut buf2 = [0u8; 500];
 
-        let mut write_buf = [0u8; RCV_BUF_MAX_SIZE + 100];
+        let mut write_buf = [0u8; RCV_BUF_MAX_SIZE as usize + 100];
 
         let mut t = ConnectionTester::new();
 
@@ -435,7 +450,7 @@ mod tests {
 
         // 1 for the SYN.
         let mut remote_first_not_sent =
-            remote_isn.wrapping_add(1 + incomplete_request.len() as u32);
+            remote_isn.wrapping_add(1 + u32::try_from(incomplete_request.len()).unwrap());
 
         // The endpoint should write an ACK at this point.
         {
@@ -461,7 +476,7 @@ mod tests {
         }
 
         remote_first_not_sent =
-            remote_first_not_sent.wrapping_add(rest_of_the_request.len() as u32);
+            remote_first_not_sent.wrapping_add(rest_of_the_request.len().try_into().unwrap());
 
         let mut endpoint_first_not_sent;
 
@@ -481,7 +496,7 @@ mod tests {
             endpoint_first_not_sent = s
                 .inner()
                 .sequence_number()
-                .wrapping_add(s.inner().payload_len() as u32);
+                .wrapping_add(u32::from(s.inner().payload_len()));
         }
 
         // Cool, now let's check that even though receive_buf is limited to some value, we can
@@ -512,7 +527,8 @@ mod tests {
                 endpoint.receive_segment(&data, mock_callback);
             }
 
-            remote_first_not_sent = remote_first_not_sent.wrapping_add(request.len() as u32);
+            remote_first_not_sent =
+                remote_first_not_sent.wrapping_add(request.len().try_into().unwrap());
 
             // Check response.
             {
@@ -526,7 +542,7 @@ mod tests {
                 assert!(response.contains("200"));
 
                 endpoint_first_not_sent =
-                    endpoint_first_not_sent.wrapping_add(s.inner().payload_len() as u32);
+                    endpoint_first_not_sent.wrapping_add(u32::from(s.inner().payload_len()));
             }
         }
 
@@ -545,11 +561,11 @@ mod tests {
 
         // Finally, let's fill self.receive_buf with the following request, and see if we get the
         // reset we expect on the next segment.
-        let request_to_fill = vec![0u8; RCV_BUF_MAX_SIZE - endpoint.receive_buf_left];
+        let request_to_fill = vec![0u8; RCV_BUF_MAX_SIZE as usize - endpoint.receive_buf_left];
 
         {
             // Hack: have to artificially increase t.mss to create this segment which is 2k+.
-            t.mss = RCV_BUF_MAX_SIZE as u16;
+            t.mss = RCV_BUF_MAX_SIZE.try_into().unwrap();
             let mut data = t.write_data(write_buf.as_mut(), request_to_fill.as_ref());
 
             data.set_flags_after_ns(TcpFlags::ACK);

@@ -6,25 +6,24 @@
 use std::fs::File;
 use std::mem;
 use std::os::raw::c_ulong;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use utils::net::mac::MacAddr;
-use utils::vm_memory::{GuestAddress, GuestMemoryMmap};
-
 #[cfg(test)]
 use crate::devices::virtio::net::device::vnet_hdr_len;
 use crate::devices::virtio::net::tap::{IfReqBuilder, Tap};
+use crate::devices::virtio::net::Net;
+use crate::devices::virtio::queue::{Queue, QueueError};
 use crate::devices::virtio::test_utils::VirtQueue;
-use crate::devices::virtio::{Net, Queue, QueueError};
 use crate::devices::DeviceError;
 use crate::mmds::data_store::Mmds;
 use crate::mmds::ns::MmdsNetworkStack;
 use crate::rate_limiter::RateLimiter;
+use crate::utils::net::mac::MacAddr;
+use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 static NEXT_INDEX: AtomicUsize = AtomicUsize::new(1);
 
@@ -77,56 +76,6 @@ pub fn default_net_no_mmds() -> Net {
 }
 
 #[derive(Debug)]
-pub enum ReadTapMock {
-    Failure,
-    MockFrame(Vec<u8>),
-    TapFrame,
-}
-
-impl ReadTapMock {
-    pub fn mock_frame(&self) -> Vec<u8> {
-        if let ReadTapMock::MockFrame(frame) = self {
-            return frame.clone();
-        }
-        panic!("Can't get last mock frame");
-    }
-}
-
-#[derive(Debug)]
-pub enum WriteTapMock {
-    Failure,
-    Success,
-}
-
-// Used to simulate tap read and write fails in tests.
-#[derive(Debug)]
-pub struct Mocks {
-    pub(crate) read_tap: ReadTapMock,
-    pub(crate) write_tap: WriteTapMock,
-}
-
-impl Mocks {
-    pub fn set_read_tap(&mut self, read_tap: ReadTapMock) {
-        self.read_tap = read_tap;
-    }
-
-    pub fn set_write_tap(&mut self, write_tap: WriteTapMock) {
-        self.write_tap = write_tap;
-    }
-}
-
-impl Default for Mocks {
-    fn default() -> Mocks {
-        Mocks {
-            read_tap: ReadTapMock::MockFrame(
-                utils::rand::rand_alphanumerics(1234).as_bytes().to_vec(),
-            ),
-            write_tap: WriteTapMock::Success,
-        }
-    }
-}
-
-#[derive(Debug)]
 pub enum NetQueue {
     Rx,
     Tx,
@@ -158,9 +107,9 @@ impl TapTrafficSimulator {
         // SAFETY: `sock_addr` is a valid pointer and safe to derference.
         unsafe {
             let sock_addr: *mut libc::sockaddr_ll = send_addr_ptr.cast::<libc::sockaddr_ll>();
-            (*sock_addr).sll_family = libc::AF_PACKET as libc::sa_family_t;
-            (*sock_addr).sll_protocol = (libc::ETH_P_ALL as u16).to_be();
-            (*sock_addr).sll_halen = libc::ETH_ALEN as u8;
+            (*sock_addr).sll_family = libc::sa_family_t::try_from(libc::AF_PACKET).unwrap();
+            (*sock_addr).sll_protocol = u16::try_from(libc::ETH_P_ALL).unwrap().to_be();
+            (*sock_addr).sll_halen = u8::try_from(libc::ETH_ALEN).unwrap();
             (*sock_addr).sll_ifindex = tap_index;
         }
 
@@ -171,7 +120,7 @@ impl TapTrafficSimulator {
             libc::bind(
                 socket.as_raw_fd(),
                 send_addr_ptr.cast(),
-                mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                libc::socklen_t::try_from(mem::size_of::<libc::sockaddr_ll>()).unwrap(),
             )
         };
         if ret == -1 {
@@ -191,8 +140,8 @@ impl TapTrafficSimulator {
             // sizeof::<libc::sockaddr_ll>(), so to return an owned value of sockaddr_ll
             // from the stack-local libc::sockaddr_storage that we have, we need to
             // 1. Create a zeroed out libc::sockaddr_ll,
-            // 2. Copy over the first size_of::<libc::sockaddr_ll>() bytes into the struct we
-            //    want to return
+            // 2. Copy over the first size_of::<libc::sockaddr_ll>() bytes into the struct we want
+            //    to return
             // We cannot simply return "*(send_addr_ptr as *const libc::sockaddr_ll)", as this
             // would return a reference to a variable that lives in the stack frame of the current
             // function, and which will no longer be valid after returning.
@@ -211,7 +160,7 @@ impl TapTrafficSimulator {
                 buf.len(),
                 0,
                 (&self.send_addr as *const libc::sockaddr_ll).cast(),
-                mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                libc::socklen_t::try_from(mem::size_of::<libc::sockaddr_ll>()).unwrap(),
             )
         };
         if res == -1 {
@@ -228,7 +177,7 @@ impl TapTrafficSimulator {
                 buf.len(),
                 0,
                 (&mut mem::zeroed() as *mut libc::sockaddr_storage).cast(),
-                &mut (mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t),
+                &mut libc::socklen_t::try_from(mem::size_of::<libc::sockaddr_storage>()).unwrap(),
             )
         };
         if ret == -1 {
@@ -262,7 +211,7 @@ pub fn if_index(tap: &Tap) -> i32 {
     let sock = create_socket();
     let ifreq = IfReqBuilder::new()
         .if_name(&tap.if_name)
-        .execute(&sock, c_ulong::from(net_gen::sockios::SIOCGIFINDEX))
+        .execute(&sock, c_ulong::from(super::gen::sockios::SIOCGIFINDEX))
         .unwrap();
 
     // SAFETY: Using this union variant is safe since `SIOCGIFINDEX` returns an integer.
@@ -285,19 +234,23 @@ pub fn enable(tap: &Tap) {
     IfReqBuilder::new()
         .if_name(&tap.if_name)
         .flags(
-            (net_gen::net_device_flags_IFF_UP
-                | net_gen::net_device_flags_IFF_RUNNING
-                | net_gen::net_device_flags_IFF_NOARP) as i16,
+            (crate::devices::virtio::net::gen::net_device_flags_IFF_UP
+                | crate::devices::virtio::net::gen::net_device_flags_IFF_RUNNING
+                | crate::devices::virtio::net::gen::net_device_flags_IFF_NOARP)
+                .try_into()
+                .unwrap(),
         )
-        .execute(&sock, c_ulong::from(net_gen::sockios::SIOCSIFFLAGS))
+        .execute(&sock, c_ulong::from(super::gen::sockios::SIOCSIFFLAGS))
         .unwrap();
 }
 
 #[cfg(test)]
 pub(crate) fn inject_tap_tx_frame(net: &Net, len: usize) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
     assert!(len >= vnet_hdr_len());
     let tap_traffic_simulator = TapTrafficSimulator::new(if_index(&net.tap));
-    let mut frame = utils::rand::rand_alphanumerics(len - vnet_hdr_len())
+    let mut frame = vmm_sys_util::rand::rand_alphanumerics(len - vnet_hdr_len())
         .as_bytes()
         .to_vec();
     tap_traffic_simulator.push_tx_packet(&frame);
@@ -306,23 +259,23 @@ pub(crate) fn inject_tap_tx_frame(net: &Net, len: usize) -> Vec<u8> {
     frame
 }
 
-pub fn write_element_in_queue(net: &Net, idx: usize, val: u64) -> Result<(), DeviceError> {
-    if idx > net.queue_evts.len() {
+pub fn write_element_in_queue(net: &Net, idx: u16, val: u64) -> Result<(), DeviceError> {
+    if idx as usize > net.queue_evts.len() {
         return Err(DeviceError::QueueError(QueueError::DescIndexOutOfBounds(
-            idx as u16,
+            idx,
         )));
     }
-    net.queue_evts[idx].write(val).unwrap();
+    net.queue_evts[idx as usize].write(val).unwrap();
     Ok(())
 }
 
-pub fn get_element_from_queue(net: &Net, idx: usize) -> Result<u64, DeviceError> {
-    if idx > net.queue_evts.len() {
+pub fn get_element_from_queue(net: &Net, idx: u16) -> Result<u64, DeviceError> {
+    if idx as usize > net.queue_evts.len() {
         return Err(DeviceError::QueueError(QueueError::DescIndexOutOfBounds(
-            idx as u16,
+            idx,
         )));
     }
-    Ok(u64::try_from(net.queue_evts[idx].as_raw_fd()).unwrap())
+    Ok(u64::try_from(net.queue_evts[idx as usize].as_raw_fd()).unwrap())
 }
 
 pub fn default_guest_mac() -> MacAddr {
@@ -342,33 +295,33 @@ pub fn assign_queues(net: &mut Net, rxq: Queue, txq: Queue) {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 pub mod test {
-    #![allow(clippy::undocumented_unsafe_blocks)]
     use std::os::unix::ffi::OsStrExt;
     use std::sync::{Arc, Mutex, MutexGuard};
-    use std::{cmp, fmt, mem};
+    use std::{cmp, fmt};
 
     use event_manager::{EventManager, SubscriberId, SubscriberOps};
-    use net_gen::ETH_HLEN;
-    use utils::vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
     use crate::check_metric_after_block;
+    use crate::devices::virtio::device::{IrqType, VirtioDevice};
     use crate::devices::virtio::net::device::vnet_hdr_len;
+    use crate::devices::virtio::net::gen::ETH_HLEN;
     use crate::devices::virtio::net::test_utils::{
-        assign_queues, default_net, inject_tap_tx_frame, NetEvent, NetQueue, ReadTapMock,
+        assign_queues, default_net, inject_tap_tx_frame, NetEvent, NetQueue,
     };
+    use crate::devices::virtio::net::{Net, MAX_BUFFER_SIZE, RX_INDEX, TX_INDEX};
+    use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::devices::virtio::test_utils::{VirtQueue, VirtqDesc};
-    use crate::devices::virtio::{
-        IrqType, Net, VirtioDevice, MAX_BUFFER_SIZE, RX_INDEX, TX_INDEX, VIRTQ_DESC_F_NEXT,
-        VIRTQ_DESC_F_WRITE,
-    };
-    use crate::logger::{IncMetric, METRICS};
+    use crate::logger::IncMetric;
+    use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
     pub struct TestHelper<'a> {
         pub event_manager: EventManager<Arc<Mutex<Net>>>,
         pub subscriber_id: SubscriberId,
         pub net: Arc<Mutex<Net>>,
-        pub mem: GuestMemoryMmap,
+        pub mem: &'a GuestMemoryMmap,
         pub rxq: VirtQueue<'a>,
         pub txq: VirtQueue<'a>,
     }
@@ -389,21 +342,14 @@ pub mod test {
     impl<'a> TestHelper<'a> {
         const QUEUE_SIZE: u16 = 16;
 
-        pub fn get_default() -> TestHelper<'a> {
+        pub fn get_default(mem: &'a GuestMemoryMmap) -> TestHelper<'a> {
             let mut event_manager = EventManager::new().unwrap();
             let mut net = default_net();
-            let mem = utils::vm_memory::test_utils::create_guest_memory_unguarded(
-                &[(GuestAddress(0), MAX_BUFFER_SIZE)],
-                false,
-            )
-            .unwrap();
-            // transmute mem_ref lifetime to 'a
-            let mem_ref = unsafe { mem::transmute::<&GuestMemoryMmap, &'a GuestMemoryMmap>(&mem) };
 
-            let rxq = VirtQueue::new(GuestAddress(0), mem_ref, Self::QUEUE_SIZE);
+            let rxq = VirtQueue::new(GuestAddress(0), mem, Self::QUEUE_SIZE);
             let txq = VirtQueue::new(
                 rxq.end().unchecked_align_up(VirtqDesc::ALIGNMENT),
-                mem_ref,
+                mem,
                 Self::QUEUE_SIZE,
             );
             assign_queues(&mut net, rxq.create_queue(), txq.create_queue());
@@ -473,7 +419,7 @@ pub mod test {
                 addr += u64::from(len);
                 // Add small random gaps between descriptor addresses in order to make sure we
                 // don't blindly read contiguous memory.
-                addr += u64::from(utils::rand::xor_pseudo_rng_u32()) % 10;
+                addr += u64::from(vmm_sys_util::rand::xor_pseudo_rng_u32()) % 10;
             }
 
             // Mark the chain as available.
@@ -485,22 +431,24 @@ pub mod test {
             event_fd.write(1).unwrap();
         }
 
-        /// Generate a tap frame of `frame_len` and check that it is deferred
-        pub fn check_rx_deferred_frame(&mut self, frame_len: usize) -> Vec<u8> {
-            self.net().tap.mocks.set_read_tap(ReadTapMock::TapFrame);
-            let used_idx = self.rxq.used.idx.get();
+        /// Generate a tap frame of `frame_len` and check that it is not read and
+        /// the descriptor chain has been discarded
+        pub fn check_rx_discarded_buffer(&mut self, frame_len: usize) -> Vec<u8> {
+            let old_used_descriptors = self.net().rx_buffer.used_descriptors;
 
             // Inject frame to tap and run epoll.
             let frame = inject_tap_tx_frame(&self.net(), frame_len);
             check_metric_after_block!(
-                METRICS.net.rx_packets_count,
+                self.net().metrics.rx_packets_count,
                 0,
                 self.event_manager.run_with_timeout(100).unwrap()
             );
-            // Check that the frame has been deferred.
-            assert!(self.net().rx_deferred_frame);
             // Check that the descriptor chain has been discarded.
-            assert_eq!(self.rxq.used.idx.get(), used_idx + 1);
+            assert_eq!(
+                self.net().rx_buffer.used_descriptors,
+                old_used_descriptors + 1
+            );
+
             assert!(&self.net().irq_trigger.has_pending_irq(IrqType::Vring));
 
             frame
@@ -509,15 +457,19 @@ pub mod test {
         /// Check that after adding a valid Rx queue descriptor chain a previously deferred frame
         /// is eventually received by the guest
         pub fn check_rx_queue_resume(&mut self, expected_frame: &[u8]) {
+            // Need to call this to flush all previous frame
+            // and advance RX queue.
+            self.net().finish_frame();
+
             let used_idx = self.rxq.used.idx.get();
             // Add a valid Rx avail descriptor chain and run epoll.
             self.add_desc_chain(
                 NetQueue::Rx,
                 0,
-                &[(0, expected_frame.len() as u32, VIRTQ_DESC_F_WRITE)],
+                &[(0, MAX_BUFFER_SIZE as u32, VIRTQ_DESC_F_WRITE)],
             );
             check_metric_after_block!(
-                METRICS.net.rx_packets_count,
+                self.net().metrics.rx_packets_count,
                 1,
                 self.event_manager.run_with_timeout(100).unwrap()
             );
@@ -525,14 +477,14 @@ pub mod test {
             assert_eq!(self.rxq.used.idx.get(), used_idx + 1);
             assert!(&self.net().irq_trigger.has_pending_irq(IrqType::Vring));
             self.rxq
-                .check_used_elem(used_idx, 0, expected_frame.len() as u32);
+                .check_used_elem(used_idx, 0, expected_frame.len().try_into().unwrap());
             self.rxq.dtable[0].check_data(expected_frame);
         }
 
         // Generates a frame of `frame_len` and writes it to the provided descriptor chain.
         // Doesn't generate an error if the descriptor chain is longer than `frame_len`.
         pub fn write_tx_frame(&self, desc_list: &[(u16, u32, u16)], frame_len: usize) -> Vec<u8> {
-            let mut frame = utils::rand::rand_alphanumerics(frame_len)
+            let mut frame = vmm_sys_util::rand::rand_alphanumerics(frame_len)
                 .as_bytes()
                 .to_vec();
             let prefix_len = vnet_hdr_len() + ETH_HLEN as usize;

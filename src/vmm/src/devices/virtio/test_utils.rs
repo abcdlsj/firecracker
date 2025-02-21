@@ -8,9 +8,10 @@ use std::marker::PhantomData;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use utils::vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
-
-use crate::devices::virtio::Queue;
+use crate::devices::virtio::queue::Queue;
+use crate::test_utils::single_region_mem;
+use crate::utils::u64_to_usize;
+use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 #[macro_export]
 macro_rules! check_metric_after_block {
@@ -19,13 +20,6 @@ macro_rules! check_metric_after_block {
         let _ = $block;
         assert_eq!($metric.count(), before + $delta, "unexpected metric value");
     }};
-}
-
-/// Creates a [`GuestMemoryMmap`] with a single region of the given size starting at guest physical
-/// address 0
-pub fn single_region_mem(region_size: usize) -> GuestMemoryMmap {
-    utils::vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), region_size)], false)
-        .unwrap()
 }
 
 /// Creates a [`GuestMemoryMmap`] with a single region  of size 65536 (= 0x10000 hex) starting at
@@ -58,7 +52,7 @@ pub struct SomeplaceInMemory<'a, T> {
 // The ByteValued trait is required to use mem.read_obj_from_addr and write_obj_at_addr.
 impl<'a, T> SomeplaceInMemory<'a, T>
 where
-    T: Debug + utils::vm_memory::ByteValued,
+    T: Debug + crate::vstate::memory::ByteValued,
 {
     fn new(location: GuestAddress, mem: &'a GuestMemoryMmap) -> Self {
         SomeplaceInMemory {
@@ -151,18 +145,16 @@ impl<'a> VirtqDesc<'a> {
     pub fn set_data(&mut self, data: &[u8]) {
         assert!(self.len.get() as usize >= data.len());
         let mem = self.addr.mem;
-        assert!(mem
-            .write_slice(data, GuestAddress::new(self.addr.get()))
-            .is_ok());
+        mem.write_slice(data, GuestAddress::new(self.addr.get()))
+            .unwrap();
     }
 
     pub fn check_data(&self, expected_data: &[u8]) {
         assert!(self.len.get() as usize >= expected_data.len());
         let mem = self.addr.mem;
         let mut buf = vec![0; expected_data.len()];
-        assert!(mem
-            .read_slice(&mut buf, GuestAddress::new(self.addr.get()))
-            .is_ok());
+        mem.read_slice(&mut buf, GuestAddress::new(self.addr.get()))
+            .unwrap();
         assert_eq!(buf.as_slice(), expected_data);
     }
 }
@@ -179,7 +171,7 @@ pub struct VirtqRing<'a, T> {
 
 impl<'a, T> VirtqRing<'a, T>
 where
-    T: Debug + utils::vm_memory::ByteValued,
+    T: Debug + crate::vstate::memory::ByteValued,
 {
     fn new(start: GuestAddress, mem: &'a GuestMemoryMmap, qsize: u16, alignment: usize) -> Self {
         assert_eq!(start.0 & (alignment as u64 - 1), 0);
@@ -223,7 +215,7 @@ pub struct VirtqUsedElem {
 }
 
 // SAFETY: `VirtqUsedElem` is a POD and contains no padding.
-unsafe impl utils::vm_memory::ByteValued for VirtqUsedElem {}
+unsafe impl crate::vstate::memory::ByteValued for VirtqUsedElem {}
 
 pub type VirtqAvail<'a> = VirtqRing<'a, u16>;
 pub type VirtqUsed<'a> = VirtqRing<'a, VirtqUsedElem>;
@@ -260,7 +252,7 @@ impl<'a> VirtQueue<'a> {
         let mut x = avail.end().0;
         x = (x + USED_ALIGN - 1) & !(USED_ALIGN - 1);
 
-        let used = VirtqUsed::new(GuestAddress(x), mem, qsize, USED_ALIGN as usize);
+        let used = VirtqUsed::new(GuestAddress(x), mem, qsize, u64_to_usize(USED_ALIGN));
 
         VirtQueue {
             dtable,
@@ -274,7 +266,8 @@ impl<'a> VirtQueue<'a> {
     }
 
     pub fn size(&self) -> u16 {
-        self.dtable.len() as u16
+        // Safe to unwrap because the size is specified as a u16 when the table is first created.
+        self.dtable.len().try_into().unwrap()
     }
 
     pub fn dtable_start(&self) -> GuestAddress {
@@ -295,9 +288,11 @@ impl<'a> VirtQueue<'a> {
 
         q.size = self.size();
         q.ready = true;
-        q.desc_table = self.dtable_start();
-        q.avail_ring = self.avail_start();
-        q.used_ring = self.used_start();
+        q.desc_table_address = self.dtable_start();
+        q.avail_ring_address = self.avail_start();
+        q.used_ring_address = self.used_start();
+
+        q.initialize(self.memory()).unwrap();
 
         q
     }
@@ -324,17 +319,16 @@ pub(crate) mod test {
     use std::sync::{Arc, Mutex, MutexGuard};
 
     use event_manager::{EventManager, MutEventSubscriber, SubscriberId, SubscriberOps};
-    use utils::vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 
+    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::net::MAX_BUFFER_SIZE;
+    use crate::devices::virtio::queue::{Queue, VIRTQ_DESC_F_NEXT};
     use crate::devices::virtio::test_utils::{VirtQueue, VirtqDesc};
-    use crate::devices::virtio::{Queue, VirtioDevice, MAX_BUFFER_SIZE, VIRTQ_DESC_F_NEXT};
+    use crate::test_utils::single_region_mem;
+    use crate::vstate::memory::{Address, GuestAddress, GuestMemoryMmap};
 
     pub fn create_virtio_mem() -> GuestMemoryMmap {
-        utils::vm_memory::test_utils::create_guest_memory_unguarded(
-            &[(GuestAddress(0), MAX_BUFFER_SIZE)],
-            false,
-        )
-        .unwrap()
+        single_region_mem(MAX_BUFFER_SIZE)
     }
 
     /// Provides functionality necessary for testing a VirtIO device with
@@ -383,7 +377,7 @@ pub(crate) mod test {
         const QUEUE_SIZE: u16 = 16;
 
         // Helper function to create a set of Virtqueues for the device
-        fn create_virtqueues(mem: &'a GuestMemoryMmap, num_queues: usize) -> Vec<VirtQueue> {
+        fn create_virtqueues(mem: &'a GuestMemoryMmap, num_queues: usize) -> Vec<VirtQueue<'a>> {
             (0..num_queues)
                 .scan(GuestAddress(0), |next_addr, _| {
                     let vqueue = VirtQueue::new(*next_addr, mem, Self::QUEUE_SIZE);
@@ -475,7 +469,7 @@ pub(crate) mod test {
                 addr += u64::from(len);
                 // Add small random gaps between descriptor addresses in order to make sure we
                 // don't blindly read contiguous memory.
-                addr += u64::from(utils::rand::xor_pseudo_rng_u32()) % 10;
+                addr += u64::from(vmm_sys_util::rand::xor_pseudo_rng_u32()) % 10;
             }
 
             // Mark the chain as available.

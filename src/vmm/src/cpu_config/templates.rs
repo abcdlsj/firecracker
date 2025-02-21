@@ -25,8 +25,6 @@ use std::fmt::Debug;
 pub use common_types::*;
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
-use versionize_derive::Versionize;
 
 /// Error for GetCpuTemplate trait.
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
@@ -42,7 +40,7 @@ pub enum GetCpuTemplateError {
     InvalidCpuModel,
 }
 
-/// Trait to unwrap the inner `CustomCpuTemplate` from Option<CpuTemplateType>.
+/// Trait to unwrap the inner [`CustomCpuTemplate`] from [`Option<CpuTemplateType>`].
 ///
 /// This trait is needed because static CPU template and custom CPU template have different nested
 /// structures: `CpuTemplateType::Static(StaticCpuTemplate::StaticTemplateType(CustomCpuTemplate))`
@@ -63,6 +61,8 @@ pub enum CpuTemplateType {
     Static(StaticCpuTemplate),
 }
 
+// This conversion is only used for snapshot, but the static CPU template
+// information has not been saved into snapshot since v1.1.
 impl From<&Option<CpuTemplateType>> for StaticCpuTemplate {
     fn from(value: &Option<CpuTemplateType>) -> Self {
         match value {
@@ -72,7 +72,18 @@ impl From<&Option<CpuTemplateType>> for StaticCpuTemplate {
     }
 }
 
-impl<'a> TryFrom<&'a [u8]> for CustomCpuTemplate {
+// This conversion is used when converting `&VmConfig` to `MachineConfig` to
+// respond `GET /machine-config` and `GET /vm`.
+impl From<&CpuTemplateType> for StaticCpuTemplate {
+    fn from(value: &CpuTemplateType) -> Self {
+        match value {
+            CpuTemplateType::Static(template) => *template,
+            CpuTemplateType::Custom(_) => StaticCpuTemplate::None,
+        }
+    }
+}
+
+impl TryFrom<&[u8]> for CustomCpuTemplate {
     type Error = serde_json::Error;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
@@ -93,7 +104,7 @@ impl TryFrom<&str> for CustomCpuTemplate {
 /// Struct to represent user defined kvm capability.
 /// Users can add or remove kvm capabilities to be checked
 /// by FC in addition to those FC checks by default.
-#[derive(Debug, Clone, Eq, PartialEq, Versionize)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KvmCapability {
     /// Add capability to the check list.
     Add(u32),
@@ -346,10 +357,10 @@ mod tests {
 
         let serialized = "\"0b0_xϽ1_xx_xx\"";
         let deserialized: Result<RegisterValueFilter<u8>, _> = serde_json::from_str(serialized);
-        assert!(deserialized.is_err());
+        deserialized.unwrap_err();
 
         let serialized = "\"0b0000_0000_0\"";
         let deserialized: Result<RegisterValueFilter<u8>, _> = serde_json::from_str(serialized);
-        assert!(deserialized.is_err());
+        deserialized.unwrap_err();
     }
 }

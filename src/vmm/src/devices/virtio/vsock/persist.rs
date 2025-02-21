@@ -4,21 +4,21 @@
 //! Defines state and support structures for persisting Vsock devices and backends.
 
 use std::fmt::Debug;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
-use snapshot::Persist;
-use utils::vm_memory::GuestMemoryMmap;
-use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
-use versionize_derive::Versionize;
+use serde::{Deserialize, Serialize};
 
 use super::*;
+use crate::devices::virtio::device::DeviceState;
 use crate::devices::virtio::persist::VirtioDeviceState;
-use crate::devices::virtio::{DeviceState, FIRECRACKER_MAX_QUEUE_SIZE, TYPE_VSOCK};
+use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
+use crate::devices::virtio::vsock::TYPE_VSOCK;
+use crate::snapshot::Persist;
+use crate::vstate::memory::GuestMemoryMmap;
 
 /// The Vsock serializable state.
-// NOTICE: Any changes to this structure require a snapshot version bump.
-#[derive(Debug, Clone, Versionize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VsockState {
     /// The vsock backend state.
     pub backend: VsockBackendState,
@@ -27,8 +27,7 @@ pub struct VsockState {
 }
 
 /// The Vsock frontend serializable state.
-// NOTICE: Any changes to this structure require a snapshot version bump.
-#[derive(Debug, Clone, Versionize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VsockFrontendState {
     /// Context IDentifier.
     pub cid: u64,
@@ -36,16 +35,14 @@ pub struct VsockFrontendState {
 }
 
 /// An enum for the serializable backend state types.
-// NOTICE: Any changes to this structure require a snapshot version bump.
-#[derive(Debug, Clone, Versionize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VsockBackendState {
     /// UDS backend state.
     Uds(VsockUdsState),
 }
 
 /// The Vsock Unix Backend serializable state.
-// NOTICE: Any changes to this structure require a snapshot version bump.
-#[derive(Debug, Clone, Versionize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VsockUdsState {
     /// The path for the UDS socket.
     pub(crate) path: String,
@@ -125,7 +122,7 @@ where
         vsock.acked_features = state.virtio_state.acked_features;
         vsock.avail_features = state.virtio_state.avail_features;
         vsock.irq_trigger.irq_status =
-            Arc::new(AtomicUsize::new(state.virtio_state.interrupt_status));
+            Arc::new(AtomicU32::new(state.virtio_state.interrupt_status));
         vsock.device_state = if state.virtio_state.activated {
             DeviceState::Activated(constructor_args.mem)
         } else {
@@ -137,13 +134,13 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use utils::byte_order;
-
     use super::device::AVAIL_FEATURES;
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::vsock::defs::uapi;
     use crate::devices::virtio::vsock::test_utils::{TestBackend, TestContext};
+    use crate::snapshot::Snapshot;
+    use crate::utils::byte_order;
 
     impl Persist<'_> for TestBackend {
         type State = VsockBackendState;
@@ -179,7 +176,6 @@ pub(crate) mod tests {
 
         // Test serialization
         let mut mem = vec![0; 4096];
-        let version_map = VersionMap::new();
 
         // Save backend and device state separately.
         let state = VsockState {
@@ -187,11 +183,9 @@ pub(crate) mod tests {
             frontend: ctx.device.save(),
         };
 
-        state
-            .serialize(&mut mem.as_mut_slice(), &version_map, 1)
-            .unwrap();
+        Snapshot::serialize(&mut mem.as_mut_slice(), &state).unwrap();
 
-        let restored_state = VsockState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap();
+        let restored_state: VsockState = Snapshot::deserialize(&mut mem.as_slice()).unwrap();
         let mut restored_device = Vsock::restore(
             VsockConstructorArgs {
                 mem: ctx.mem.clone(),

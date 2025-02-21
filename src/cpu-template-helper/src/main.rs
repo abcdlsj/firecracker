@@ -5,9 +5,7 @@ use std::fs::{read_to_string, write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use vmm::cpu_config::templates::{CustomCpuTemplate, GetCpuTemplate, GetCpuTemplateError};
-
-use crate::utils::UtilsError;
+use vmm::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError};
 
 mod fingerprint;
 mod template;
@@ -26,7 +24,7 @@ enum HelperError {
     /// Failed to serialize/deserialize JSON file: {0}
     Serde(#[from] serde_json::Error),
     /// {0}
-    Utils(#[from] UtilsError),
+    Utils(#[from] utils::UtilsError),
     /// {0}
     TemplateDump(#[from] template::dump::DumpError),
     /// {0}
@@ -58,7 +56,10 @@ enum TemplateOperation {
     Dump {
         /// Path of firecracker config file.
         #[arg(short, long, value_name = "PATH")]
-        config: PathBuf,
+        config: Option<PathBuf>,
+        /// Path of CPU template to apply.
+        #[arg(short, long, value_name = "PATH")]
+        template: Option<PathBuf>,
         /// Path of output file.
         #[arg(short, long, value_name = "PATH", default_value = "cpu_config.json")]
         output: PathBuf,
@@ -74,9 +75,12 @@ enum TemplateOperation {
     },
     /// Verify that the given CPU template file is applied as intended.
     Verify {
-        /// Path of firecracker config file specifying the target CPU template.
+        /// Path of firecracker config file.
         #[arg(short, long, value_name = "PATH")]
-        config: PathBuf,
+        config: Option<PathBuf>,
+        /// Path of the target CPU template.
+        #[arg(short, long, value_name = "PATH")]
+        template: Option<PathBuf>,
     },
 }
 
@@ -84,9 +88,12 @@ enum TemplateOperation {
 enum FingerprintOperation {
     /// Dump fingerprint consisting of host-related information and guest CPU config.
     Dump {
-        /// Path of fingerprint config file.
+        /// Path of firecracker config file.
         #[arg(short, long, value_name = "PATH")]
-        config: PathBuf,
+        config: Option<PathBuf>,
+        /// Path of CPU template to apply.
+        #[arg(short, long, value_name = "PATH")]
+        template: Option<PathBuf>,
         /// Path of output file.
         #[arg(short, long, value_name = "PATH", default_value = "fingerprint.json")]
         output: PathBuf,
@@ -114,9 +121,17 @@ enum FingerprintOperation {
 fn run(cli: Cli) -> Result<(), HelperError> {
     match cli.command {
         Command::Template(op) => match op {
-            TemplateOperation::Dump { config, output } => {
-                let config = read_to_string(config)?;
-                let (vmm, _) = utils::build_microvm_from_config(&config)?;
+            TemplateOperation::Dump {
+                config,
+                template,
+                output,
+            } => {
+                let config = config.map(read_to_string).transpose()?;
+                let template = template
+                    .as_ref()
+                    .map(utils::load_cpu_template)
+                    .transpose()?;
+                let (vmm, _) = utils::build_microvm_from_config(config, template)?;
 
                 let cpu_config = template::dump::dump(vmm)?;
 
@@ -124,12 +139,10 @@ fn run(cli: Cli) -> Result<(), HelperError> {
                 write(output, cpu_config_json)?;
             }
             TemplateOperation::Strip { paths, suffix } => {
-                let mut templates = Vec::with_capacity(paths.len());
-                for path in &paths {
-                    let template_json = read_to_string(path)?;
-                    let template: CustomCpuTemplate = serde_json::from_str(&template_json)?;
-                    templates.push(template);
-                }
+                let templates = paths
+                    .iter()
+                    .map(utils::load_cpu_template)
+                    .collect::<Result<Vec<_>, utils::UtilsError>>()?;
 
                 let stripped_templates = template::strip::strip(templates)?;
 
@@ -139,12 +152,16 @@ fn run(cli: Cli) -> Result<(), HelperError> {
                     write(path, template_json)?;
                 }
             }
-            TemplateOperation::Verify { config } => {
-                let config = read_to_string(config)?;
-                let (vmm, vm_resources) = utils::build_microvm_from_config(&config)?;
+            TemplateOperation::Verify { config, template } => {
+                let config = config.map(read_to_string).transpose()?;
+                let template = template
+                    .as_ref()
+                    .map(utils::load_cpu_template)
+                    .transpose()?;
+                let (vmm, vm_resources) = utils::build_microvm_from_config(config, template)?;
 
                 let cpu_template = vm_resources
-                    .vm_config
+                    .machine_config
                     .cpu_template
                     .get_cpu_template()?
                     .into_owned();
@@ -154,9 +171,17 @@ fn run(cli: Cli) -> Result<(), HelperError> {
             }
         },
         Command::Fingerprint(op) => match op {
-            FingerprintOperation::Dump { config, output } => {
-                let config = read_to_string(config)?;
-                let (vmm, _) = utils::build_microvm_from_config(&config)?;
+            FingerprintOperation::Dump {
+                config,
+                template,
+                output,
+            } => {
+                let config = config.map(read_to_string).transpose()?;
+                let template = template
+                    .as_ref()
+                    .map(utils::load_cpu_template)
+                    .transpose()?;
+                let (vmm, _) = utils::build_microvm_from_config(config, template)?;
 
                 let fingerprint = fingerprint::dump::dump(vmm)?;
 
@@ -169,9 +194,9 @@ fn run(cli: Cli) -> Result<(), HelperError> {
                 filters,
             } => {
                 let prev_json = read_to_string(prev)?;
-                let prev: fingerprint::Fingerprint = serde_json::from_str(&prev_json)?;
+                let prev = serde_json::from_str(&prev_json)?;
                 let curr_json = read_to_string(curr)?;
-                let curr: fingerprint::Fingerprint = serde_json::from_str(&curr_json)?;
+                let curr = serde_json::from_str(&curr_json)?;
                 fingerprint::compare::compare(prev, curr, filters)?;
             }
         },
@@ -180,14 +205,14 @@ fn run(cli: Cli) -> Result<(), HelperError> {
     Ok(())
 }
 
-fn main() -> Result<(), HelperError> {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = run(cli);
     if let Err(e) = result {
         eprintln!("{}", e);
-        Err(e)
+        std::process::ExitCode::FAILURE
     } else {
-        Ok(())
+        std::process::ExitCode::SUCCESS
     }
 }
 
@@ -195,69 +220,9 @@ fn main() -> Result<(), HelperError> {
 mod tests {
     use std::io::Write;
 
-    use ::utils::tempfile::TempFile;
-    use vmm::utilities::mock_resources::kernel_image_path;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-
-    pub fn generate_config(kernel_image_path: &str, rootfs_path: &str) -> String {
-        format!(
-            r#"{{
-                "boot-source": {{
-                    "kernel_image_path": "{}"
-                }},
-                "drives": [
-                    {{
-                        "drive_id": "rootfs",
-                        "path_on_host": "{}",
-                        "is_root_device": true,
-                        "is_read_only": false
-                    }}
-                ]
-            }}"#,
-            kernel_image_path, rootfs_path,
-        )
-    }
-
-    pub fn generate_config_with_template(
-        kernel_image_path: &str,
-        rootfs_path: &str,
-        cpu_template_path: &str,
-    ) -> String {
-        format!(
-            r#"{{
-                "boot-source": {{
-                    "kernel_image_path": "{}"
-                }},
-                "drives": [
-                    {{
-                        "drive_id": "rootfs",
-                        "path_on_host": "{}",
-                        "is_root_device": true,
-                        "is_read_only": false
-                    }}
-                ],
-                "cpu-config": "{}"
-            }}"#,
-            kernel_image_path, rootfs_path, cpu_template_path,
-        )
-    }
-
-    fn generate_config_file(
-        kernel_image_path: &str,
-        rootfs_path: &str,
-        cpu_template_path: Option<&str>,
-    ) -> TempFile {
-        let config = match cpu_template_path {
-            Some(cpu_template_path) => {
-                generate_config_with_template(kernel_image_path, rootfs_path, cpu_template_path)
-            }
-            None => generate_config(kernel_image_path, rootfs_path),
-        };
-        let config_file = TempFile::new().unwrap();
-        config_file.as_file().write_all(config.as_bytes()).unwrap();
-        config_file
-    }
 
     // Sample modifiers for x86_64 that should work correctly as a CPU template and a guest CPU
     // config.
@@ -334,21 +299,11 @@ mod tests {
 
     #[test]
     fn test_template_dump_command() {
-        let kernel_image_path = kernel_image_path(None);
-        let rootfs_file = TempFile::new().unwrap();
-        let config_file = generate_config_file(
-            &kernel_image_path,
-            rootfs_file.as_path().to_str().unwrap(),
-            None,
-        );
         let output_file = TempFile::new().unwrap();
-
         let args = vec![
             "cpu-template-helper",
             "template",
             "dump",
-            "--config",
-            config_file.as_path().to_str().unwrap(),
             "--output",
             output_file.as_path().to_str().unwrap(),
         ];
@@ -359,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_template_strip_command() {
-        let files = vec![generate_sample_template(), generate_sample_template()];
+        let files = [generate_sample_template(), generate_sample_template()];
 
         let mut args = vec!["cpu-template-helper", "template", "strip", "-p"];
         let paths = files
@@ -374,21 +329,13 @@ mod tests {
 
     #[test]
     fn test_template_verify_command() {
-        let kernel_image_path = kernel_image_path(None);
-        let rootfs_file = TempFile::new().unwrap();
         let template_file = generate_sample_template();
-        let config_file = generate_config_file(
-            &kernel_image_path,
-            rootfs_file.as_path().to_str().unwrap(),
-            Some(template_file.as_path().to_str().unwrap()),
-        );
-
         let args = vec![
             "cpu-template-helper",
             "template",
             "verify",
-            "--config",
-            config_file.as_path().to_str().unwrap(),
+            "--template",
+            template_file.as_path().to_str().unwrap(),
         ];
         let cli = Cli::parse_from(args);
 
@@ -397,21 +344,11 @@ mod tests {
 
     #[test]
     fn test_fingerprint_dump_command() {
-        let kernel_image_path = kernel_image_path(None);
-        let rootfs_file = TempFile::new().unwrap();
-        let config_file = generate_config_file(
-            &kernel_image_path,
-            rootfs_file.as_path().to_str().unwrap(),
-            None,
-        );
         let output_file = TempFile::new().unwrap();
-
         let args = vec![
             "cpu-template-helper",
             "fingerprint",
             "dump",
-            "--config",
-            config_file.as_path().to_str().unwrap(),
             "--output",
             output_file.as_path().to_str().unwrap(),
         ];

@@ -1,6 +1,6 @@
 [package]
 name = "seccompiler"
-version = "1.5.0-dev"
+version = "1.11.0-dev"
 authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
 edition = "2021"
 description = "Program that compiles multi-threaded seccomp-bpf filters expressed as JSON into raw BPF programs, serializing them and outputting them to a file."
@@ -12,15 +12,18 @@ bench = false
 
 [[bin]]
 name = "seccompiler-bin"
-path = "src/seccompiler_bin.rs"
+path = "src/bin.rs"
 bench = false
 
 [dependencies]
 bincode = "1.2.1"
-displaydoc = "0.2.4"
-libc = "0.2.148"
-serde = { version = "1.0.188", features = ["derive"] }
-serde_json = "1.0.107"
-thiserror = "1.0.48"
+clap = { version = "4.5.29", features = ["derive", "string"] }
+displaydoc = "0.2.5"
+libc = "0.2.169"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
+thiserror = "2.0.11"
+zerocopy = { version = "0.8.18" }
 
-utils = { path = "../utils" }
+[lints]
+workspace = true

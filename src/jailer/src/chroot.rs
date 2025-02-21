@@ -6,7 +6,7 @@ use std::ffi::CStr;
 use std::path::Path;
 use std::ptr::null;
 
-use utils::syscall::SyscallReturnCode;
+use vmm_sys_util::syscall::SyscallReturnCode;
 
 use super::{to_cstring, JailerError};
 
@@ -83,7 +83,7 @@ pub fn chroot(path: &Path) -> Result<(), JailerError> {
     // SAFETY: Safe because we provide valid parameters.
     SyscallReturnCode(unsafe {
         libc::syscall(libc::SYS_pivot_root, cwd.as_ptr(), old_root_dir.as_ptr())
-    } as libc::c_int)
+    })
     .into_empty_result()
     .map_err(JailerError::PivotRoot)?;
 

@@ -11,7 +11,6 @@ import pytest
 from framework import utils
 from framework.defs import SUPPORTED_HOST_KERNELS
 from framework.properties import global_props
-from framework.utils_cpu_templates import nonci_on_arm
 from framework.utils_cpuid import get_guest_cpuid
 from host_tools import cargo_build
 
@@ -31,32 +30,26 @@ class CpuTemplateHelper:
         """Build CPU template helper tool binary"""
         self.binary = cargo_build.get_binary(self.BINARY_NAME)
 
-    def template_dump(self, vm_config_path, output_path):
+    def template_dump(self, output_path):
         """Dump guest CPU config in the JSON custom CPU template format"""
-        cmd = (
-            f"{self.binary} template dump"
-            f" --config {vm_config_path} --output {output_path}"
-        )
-        utils.run_cmd(cmd)
+        cmd = f"{self.binary} template dump --output {output_path}"
+        utils.check_output(cmd)
 
     def template_strip(self, paths, suffix=""):
         """Strip entries shared between multiple CPU template files"""
         paths = " ".join([str(path) for path in paths])
         cmd = f"{self.binary} template strip --paths {paths} --suffix '{suffix}'"
-        utils.run_cmd(cmd)
+        utils.check_output(cmd)
 
-    def template_verify(self, vm_config_path):
+    def template_verify(self, template_path):
         """Verify the specified CPU template"""
-        cmd = f"{self.binary} template verify --config {vm_config_path}"
-        utils.run_cmd(cmd)
+        cmd = f"{self.binary} template verify --template {template_path}"
+        utils.check_output(cmd)
 
-    def fingerprint_dump(self, vm_config_path, output_path):
+    def fingerprint_dump(self, output_path):
         """Dump a fingerprint"""
-        cmd = (
-            f"{self.binary} fingerprint dump"
-            f" --config {vm_config_path} --output {output_path}"
-        )
-        utils.run_cmd(cmd)
+        cmd = f"{self.binary} fingerprint dump --output {output_path}"
+        utils.check_output(cmd)
 
     def fingerprint_compare(
         self,
@@ -71,32 +64,13 @@ class CpuTemplateHelper:
         )
         if filters:
             cmd += f" --filters {' '.join(filters)}"
-        utils.run_cmd(cmd)
+        utils.check_output(cmd)
 
 
 @pytest.fixture(scope="session", name="cpu_template_helper")
 def cpu_template_helper_fixture():
     """Fixture of CPU template helper tool"""
     return CpuTemplateHelper()
-
-
-def save_vm_config(microvm, tmp_path, custom_cpu_template=None):
-    """
-    Save VM config into JSON file.
-    """
-    config_json = microvm.api.vm_config.get().json()
-    config_json["boot-source"]["kernel_image_path"] = str(microvm.kernel_file)
-    config_json["drives"][0]["path_on_host"] = str(microvm.rootfs_file)
-    if custom_cpu_template is not None:
-        custom_cpu_template_path = tmp_path / "template.json"
-        Path(custom_cpu_template_path).write_text(
-            json.dumps(custom_cpu_template), encoding="utf-8"
-        )
-        config_json["cpu-config"] = str(custom_cpu_template_path)
-
-    vm_config_path = tmp_path / "vm_config.json"
-    Path(vm_config_path).write_text(json.dumps(config_json), encoding="utf-8")
-    return vm_config_path
 
 
 def build_cpu_config_dict(cpu_config_path):
@@ -172,13 +146,14 @@ UNAVAILABLE_CPUID_ON_DUMP_LIST = [
     # https://github.com/torvalds/linux/commit/8765d75329a386dd7742f94a1ea5fdcdea8d93d0
     (0x8000001B, 0x0),
     (0x8000001C, 0x0),
-    (0x8000001F, 0x0),
     # CPUID.80860000h is a Transmeta-specific leaf.
     (0x80860000, 0x0),
     # CPUID.C0000000h is a Centaur-specific leaf.
     (0xC0000000, 0x0),
 ]
 
+# An upper range of CPUID leaves which are not supported by our kernels
+UNAVAILABLE_CPUID_UPPER_RANGE = range(0x8000001F, 0x80000029)
 
 # Dictionary of CPUID bitmasks that should not be tested due to its mutability.
 CPUID_EXCEPTION_LIST = {
@@ -209,6 +184,9 @@ MSR_EXCEPTION_LIST = [
     0x48,
     # MSR_IA32_SMBASE is not accessible outside of System Management Mode.
     0x9E,
+    # MSR_IA32_TSX_CTRL is R/W MSR to disable Intel TSX feature as a mitigation
+    # against TAA vulnerability.
+    0x122,
     # MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP and MSR_IA32_SYSENTER_EIP are
     # R/W MSRs that will be set up by OS to call fast system calls with
     # SYSENTER.
@@ -282,18 +260,16 @@ def test_cpu_config_dump_vs_actual(
     Verify that the dumped CPU config matches the actual CPU config inside
     guest.
     """
-    microvm = microvm_factory.build(guest_kernel, rootfs)
-    microvm.spawn()
-    microvm.basic_config()
-    microvm.add_net_iface()
-    vm_config_path = save_vm_config(microvm, tmp_path)
-
     # Dump CPU config with the helper tool.
     cpu_config_path = tmp_path / "cpu_config.json"
-    cpu_template_helper.template_dump(vm_config_path, cpu_config_path)
+    cpu_template_helper.template_dump(cpu_config_path)
     dump_cpu_config = build_cpu_config_dict(cpu_config_path)
 
     # Retrieve actual CPU config from guest
+    microvm = microvm_factory.build(guest_kernel, rootfs)
+    microvm.spawn()
+    microvm.basic_config(vcpu_count=1)
+    microvm.add_net_iface()
     microvm.start()
     actual_cpu_config = {
         "cpuid": get_guest_cpuid(microvm),
@@ -305,6 +281,8 @@ def test_cpu_config_dump_vs_actual(
     keys_not_in_dump = {}
     for key, actual in actual_cpu_config["cpuid"].items():
         if (key[0], key[1]) in UNAVAILABLE_CPUID_ON_DUMP_LIST:
+            continue
+        if key[0] in UNAVAILABLE_CPUID_UPPER_RANGE:
             continue
         if key not in dump_cpu_config["cpuid"]:
             keys_not_in_dump[key] = actual_cpu_config["cpuid"][key]
@@ -348,125 +326,55 @@ def test_cpu_config_dump_vs_actual(
         ), f"Mismatched MSR for {key:#010x}: {actual=:#066b} vs. {dump=:#066b}"
 
 
-def detect_fingerprint_change(microvm, tmp_path, cpu_template_helper, filters=None):
-    """
-    Compare fingerprint files with filters between one taken at the moment and
-    a baseline file taken in a specific point in time.
-    """
-    # Generate VM config from test_microvm_with_api
-    microvm.spawn()
-    microvm.basic_config()
-    vm_config_path = save_vm_config(microvm, tmp_path)
-
-    # Dump a fingerprint with the generated VM config.
-    fingerprint_path = tmp_path / "fingerprint.json"
-    cpu_template_helper.fingerprint_dump(vm_config_path, fingerprint_path)
-
-    # Baseline fingerprint.
-    baseline_path = (
-        TEST_RESOURCES_DIR
-        / f"fingerprint_{global_props.cpu_codename}_{global_props.host_linux_version}host.json"
-    )
-    # Use this code to generate baseline fingerprint.
-    # cpu_template_helper.fingerprint_dump(vm_config_path, baseline_path)
-
-    # Compare with baseline
-    cpu_template_helper.fingerprint_compare(
-        baseline_path,
-        fingerprint_path,
-        filters,
-    )
-
-
 @pytest.mark.no_block_pr
 @pytest.mark.skipif(
     global_props.host_linux_version not in SUPPORTED_HOST_KERNELS,
     reason=f"Supported kernels are {SUPPORTED_HOST_KERNELS}",
 )
-def test_guest_cpu_config_change(test_microvm_with_api, tmp_path, cpu_template_helper):
+def test_guest_cpu_config_change(results_dir, cpu_template_helper):
     """
     Verify that the guest CPU config has not changed since the baseline
     fingerprint was gathered.
     """
-    if (
-        global_props.host_linux_version == "4.14"
-        and global_props.instance == "c7g.metal"
-    ):
-        # The non-SVE kernel has a different value in 0x6030000000100040 because
-        # it's an old kernel.
-        pytest.skip("old kernel has different fingerprint")
-    detect_fingerprint_change(
-        test_microvm_with_api,
-        tmp_path,
-        cpu_template_helper,
+    fname = f"fingerprint_{global_props.cpu_codename}_{global_props.host_linux_version}host.json"
+
+    # Dump a fingerprint with the generated VM config.
+    fingerprint_path = results_dir / fname
+    cpu_template_helper.fingerprint_dump(fingerprint_path)
+
+    # Baseline fingerprint.
+    baseline_path = TEST_RESOURCES_DIR / fname
+
+    # Compare with baseline
+    cpu_template_helper.fingerprint_compare(
+        baseline_path,
+        fingerprint_path,
         ["guest_cpu_config"],
     )
 
 
-@pytest.mark.nonci
-def test_fingerprint_change(test_microvm_with_api, tmp_path, cpu_template_helper):
-    """
-    Verify that all the fields of the fingerprint has not changed since the
-    baseline fingerprint was gathered.
-    """
-    detect_fingerprint_change(
-        test_microvm_with_api,
-        tmp_path,
-        cpu_template_helper,
-    )
-
-
-@nonci_on_arm
-def test_json_static_templates(
-    test_microvm_with_api, cpu_template_helper, tmp_path, custom_cpu_template
-):
+def test_json_static_templates(cpu_template_helper, tmp_path, custom_cpu_template):
     """
     Verify that JSON static CPU templates are applied as intended.
     """
-    # Generate VM config with JSON static CPU template
-    microvm = test_microvm_with_api
-    microvm.spawn()
-    microvm.basic_config()
-    vm_config_path = save_vm_config(microvm, tmp_path, custom_cpu_template["template"])
+    custom_cpu_template_path = tmp_path / "template.json"
+    Path(custom_cpu_template_path).write_text(
+        json.dumps(custom_cpu_template["template"]), encoding="utf-8"
+    )
 
     # Verify the JSON static CPU template.
-    cpu_template_helper.template_verify(vm_config_path)
+    cpu_template_helper.template_verify(custom_cpu_template_path)
 
 
-def test_consecutive_cpu_config_consistency(
-    test_microvm_with_api, cpu_template_helper, tmp_path
-):
+def test_consecutive_fingerprint_consistency(cpu_template_helper, tmp_path):
     """
-    Verify that two dumped guest CPU configs obtained consecutively are
-    consistent. The dumped guest CPU config should not change without
-    any environmental changes (firecracker, kernel, microcode updates).
+    Verify that two fingerprints obtained consecutively are consistent.
     """
-    microvm = test_microvm_with_api
-    microvm.spawn()
-    microvm.basic_config()
-    vm_config_path = save_vm_config(microvm, tmp_path)
+    # Dump a fingerprint with the helper tool.
+    fp1 = tmp_path / "fp1.json"
+    cpu_template_helper.fingerprint_dump(fp1)
+    fp2 = tmp_path / "fp2.json"
+    cpu_template_helper.fingerprint_dump(fp2)
 
-    # Dump CPU config with the helper tool.
-    cpu_config_1 = tmp_path / "cpu_config_1.json"
-    cpu_template_helper.template_dump(vm_config_path, cpu_config_1)
-    cpu_config_2 = tmp_path / "cpu_config_2.json"
-    cpu_template_helper.template_dump(vm_config_path, cpu_config_2)
-
-    # Strip common entries.
-    cpu_template_helper.template_strip([cpu_config_1, cpu_config_2])
-
-    # Check the stripped result is empty.
-    if PLATFORM == "x86_64":
-        empty_cpu_config = {
-            "cpuid_modifiers": [],
-            "kvm_capabilities": [],
-            "msr_modifiers": [],
-        }
-    elif PLATFORM == "aarch64":
-        empty_cpu_config = {
-            "kvm_capabilities": [],
-            "reg_modifiers": [],
-            "vcpu_features": [],
-        }
-    assert json.loads(cpu_config_1.read_text(encoding="utf-8")) == empty_cpu_config
-    assert json.loads(cpu_config_2.read_text(encoding="utf-8")) == empty_cpu_config
+    # Compare them.
+    cpu_template_helper.fingerprint_compare(fp1, fp2, None)

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 pub use crate::devices::virtio::balloon::device::BalloonStats;
-pub use crate::devices::virtio::BALLOON_DEV_ID;
-use crate::devices::virtio::{Balloon, BalloonConfig};
+pub use crate::devices::virtio::balloon::BALLOON_DEV_ID;
+use crate::devices::virtio::balloon::{Balloon, BalloonConfig};
 
 type MutexBalloon = Arc<Mutex<Balloon>>;
 
@@ -24,10 +24,12 @@ pub enum BalloonConfigError {
     TooManyPagesRequested,
     /// Statistics for the balloon device are not enabled
     StatsNotFound,
-    /// Error creating the balloon device: {0:?}
+    /// Error creating the balloon device: {0}
     CreateFailure(crate::devices::virtio::balloon::BalloonError),
-    /// Error updating the balloon device configuration: {0:?}
+    /// Error updating the balloon device configuration: {0}
     UpdateFailure(std::io::Error),
+    /// Firecracker's huge pages support is incompatible with memory ballooning.
+    HugePages,
 }
 
 /// This struct represents the strongly typed equivalent of the json body
@@ -125,7 +127,7 @@ impl BalloonBuilder {
 impl Default for BalloonBuilder {
     fn default() -> BalloonBuilder {
         let mut balloon = BalloonBuilder::new();
-        assert!(balloon.set(BalloonDeviceConfig::default()).is_ok());
+        balloon.set(BalloonDeviceConfig::default()).unwrap();
         balloon
     }
 }

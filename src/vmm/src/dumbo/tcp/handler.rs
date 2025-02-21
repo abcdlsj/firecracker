@@ -13,8 +13,8 @@ use std::num::NonZeroUsize;
 use micro_http::{Request, Response};
 
 use crate::dumbo::pdu::bytes::NetworkBytes;
-use crate::dumbo::pdu::ipv4::{Error as IPv4PacketError, IPv4Packet, PROTOCOL_TCP};
-use crate::dumbo::pdu::tcp::{Error as TcpSegmentError, Flags as TcpFlags, TcpSegment};
+use crate::dumbo::pdu::ipv4::{IPv4Packet, Ipv4Error as IPv4PacketError, PROTOCOL_TCP};
+use crate::dumbo::pdu::tcp::{Flags as TcpFlags, TcpError as TcpSegmentError, TcpSegment};
 use crate::dumbo::tcp::endpoint::Endpoint;
 use crate::dumbo::tcp::{NextSegmentStatus, RstConfig};
 
@@ -57,12 +57,12 @@ pub enum WriteEvent {
 ///
 /// [`receive_packet`]: struct.TcpIPv4Handler.html#method.receive_packet
 /// [`TcpIPv4Handler`]: struct.TcpIPv4Handler.html
-#[derive(Debug, PartialEq, Eq, derive_more::From)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum RecvError {
     /// The inner segment has an invalid destination port.
     InvalidPort,
-    /// The handler encountered an error while parsing the inner TCP segment.
-    TcpSegment(TcpSegmentError),
+    /// The handler encountered an error while parsing the inner TCP segment: {0}
+    TcpSegment(#[from] TcpSegmentError),
 }
 
 /// Describes errors which may be encountered by the [`write_next_packet`] method from
@@ -70,12 +70,12 @@ pub enum RecvError {
 ///
 /// [`write_next_packet`]: struct.TcpIPv4Handler.html#method.write_next_packet
 /// [`TcpIPv4Handler`]: struct.TcpIPv4Handler.html
-#[derive(Debug, PartialEq, Eq, derive_more::From)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum WriteNextError {
-    /// There was an error while writing the contents of the IPv4 packet.
-    IPv4Packet(IPv4PacketError),
-    /// There was an error while writing the contents of the inner TCP segment.
-    TcpSegment(TcpSegmentError),
+    /// There was an error while writing the contents of the IPv4 packet: {0}
+    IPv4Packet(#[from] IPv4PacketError),
+    /// There was an error while writing the contents of the inner TCP segment: {0}
+    TcpSegment(#[from] TcpSegmentError),
 }
 
 // Generally speaking, a TCP/IPv4 connection is identified using the four-tuple (src_addr, src_port,
@@ -129,7 +129,7 @@ pub struct TcpIPv4Handler {
     // This map holds the currently active endpoints, identified by their connection tuple.
     connections: HashMap<ConnectionTuple, Endpoint>,
     // Maximum number of concurrent connections we are willing to handle.
-    max_connections: usize,
+    max_connections: NonZeroUsize,
     // Holds connections which are able to send segments immediately.
     active_connections: HashSet<ConnectionTuple>,
     // Remembers the closest timestamp into the future when one of the connections has to deal
@@ -138,7 +138,7 @@ pub struct TcpIPv4Handler {
     // RST segments awaiting to be sent.
     rst_queue: Vec<(ConnectionTuple, RstConfig)>,
     // Maximum size of the RST queue.
-    max_pending_resets: usize,
+    max_pending_resets: NonZeroUsize,
 }
 
 // Only used locally, in the receive_packet method, to differentiate between different outcomes
@@ -164,16 +164,14 @@ impl TcpIPv4Handler {
         max_connections: NonZeroUsize,
         max_pending_resets: NonZeroUsize,
     ) -> Self {
-        let max_connections = max_connections.get();
-        let max_pending_resets = max_pending_resets.get();
         TcpIPv4Handler {
             local_ipv4_addr,
             local_port,
-            connections: HashMap::with_capacity(max_connections),
+            connections: HashMap::with_capacity(max_connections.get()),
             max_connections,
-            active_connections: HashSet::with_capacity(max_connections),
+            active_connections: HashSet::with_capacity(max_connections.get()),
             next_timeout: None,
-            rst_queue: Vec::with_capacity(max_pending_resets),
+            rst_queue: Vec::with_capacity(max_pending_resets.get()),
             max_pending_resets,
         }
     }
@@ -194,12 +192,12 @@ impl TcpIPv4Handler {
     }
 
     /// Returns the max connections of this TCP handler.
-    pub fn max_connections(&self) -> usize {
+    pub fn max_connections(&self) -> NonZeroUsize {
         self.max_connections
     }
 
     /// Returns the max pending resets of this TCP handler.
-    pub fn max_pending_resets(&self) -> usize {
+    pub fn max_pending_resets(&self) -> NonZeroUsize {
         self.max_pending_resets
     }
 
@@ -257,7 +255,7 @@ impl TcpIPv4Handler {
                     Err(_) => return Ok(RecvEvent::FailedNewConnection),
                 };
 
-                if self.connections.len() >= self.max_connections {
+                if self.connections.len() >= self.max_connections.get() {
                     if let Some(evict_tuple) = self.find_evictable_connection() {
                         let rst_config = self.connections[&evict_tuple]
                             .connection()
@@ -363,7 +361,7 @@ impl TcpIPv4Handler {
 
     fn enqueue_rst_config(&mut self, tuple: ConnectionTuple, cfg: RstConfig) {
         // We simply forgo sending any RSTs if the queue is already full.
-        if self.rst_queue.len() < self.max_pending_resets {
+        if self.rst_queue.len() < self.max_pending_resets.get() {
             self.rst_queue.push((tuple, cfg));
         }
     }
@@ -544,7 +542,7 @@ mod tests {
             (p.header_len(), p.len())
         };
 
-        TcpSegment::from_bytes(&mut buf[segment_start..segment_end], None).unwrap()
+        TcpSegment::from_bytes(&mut buf[segment_start.into()..segment_end], None).unwrap()
     }
 
     // Calls write_next_packet until either an error occurs, or there's nothing left to send.

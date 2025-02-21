@@ -16,11 +16,14 @@ This command dumps guest CPU configuration in the custom CPU template JSON
 format.
 
 ```
-cpu-template-helper template dump --config <firecracker-config> --output <cpu-config>
+cpu-template-helper template dump \
+    --output <cpu-config> \
+    [--template <cpu-template>] \
+    [--config <firecracker-config>]
 ```
 
-Users can utilize this as an entry point of a custom CPU template creation
-to comprehend what CPU configuration are exposed to guests.
+Users can utilize this as an entry point of a custom CPU template creation to
+comprehend what CPU configuration are exposed to guests.
 
 The guest CPU configuration consists of the following entities:
 
@@ -35,15 +38,14 @@ process as Firecacker and capturing them in the state just before booting a
 guest. More details about the preboot process can be found
 [here](boot-protocol.md) and [here](cpuid-normalization.md).
 
-> **Note**
-Some MSRs and ARM registers are not included in the output, since they are not
-reasonable to modify with CPU templates. The full list of them can be found in
-[Appendix](#appendix).
+> **Note** Some MSRs and ARM registers are not included in the output, since
+> they are not reasonable to modify with CPU templates. The full list of them
+> can be found in [Appendix](#appendix).
 
-> **Note**
-Since the output depends on underlying hardware and software stack (BIOS, CPU,
-kernel, Firecracker), it is required to dump guest CPU configuration on each
-combination when creating a custom CPU template targetting them all.
+> **Note** Since the output depends on underlying hardware and software stack
+> (BIOS, CPU, kernel, Firecracker), it is required to dump guest CPU
+> configuration on each combination when creating a custom CPU template
+> targetting them all.
 
 #### Strip command
 
@@ -58,9 +60,9 @@ cpu-template-helper template strip \
 
 One practical use case of the CPU template feature is to provide a consistent
 CPU feature set to guests running on multiple CPU models. When creating a custom
-CPU template for this purpose, it is efficient to focus on the differences
-in guest CPU configurations across those CPU models. Given that a dumped guest
-CPU configuration typically amounts to approximately 1,000 lines, this command
+CPU template for this purpose, it is efficient to focus on the differences in
+guest CPU configurations across those CPU models. Given that a dumped guest CPU
+configuration typically amounts to approximately 1,000 lines, this command
 considerably narrows down the scope to consider.
 
 #### Verify command
@@ -69,7 +71,8 @@ This command verifies that the given custom CPU template is applied correctly.
 
 ```
 cpu-template-helper template verify \
-    --config <firecracker-config>
+    --template <cpu-template> \
+    [--config <firecracker-config>]
 ```
 
 Firecracker modifies the guest CPU configuration after the CPU template is
@@ -78,13 +81,13 @@ not set the given configuration. Since Firecracker does not check them at
 runtime, it is required to ensure that these situations don't happen with their
 custom CPU templates before deploying it.
 
-The command uses the same configuration file as Firecracker and the path to the
-custom CPU template file should be specified in the "cpu-config" field.
+When a template is specified both through `--template` and in Firecracker
+configuration file provided via `--config`, the template specified with
+`--template` takes precedence.
 
-> **Note**
-This command does not ensure that the contents of the template are sensible.
-Thus, users need to make sure that the template does not have any inconsistent
-entries and does not crash guests.
+> **Note** This command does not ensure that the contents of the template are
+> sensible. Thus, users need to make sure that the template does not have any
+> inconsistent entries and does not crash guests.
 
 ### Fingerprint-related commands
 
@@ -95,15 +98,16 @@ information that could affect the validity of custom CPU templates.
 
 ```
 cpu-template-helper fingerprint dump \
-    --config <firecracker-config> \
-    --output <output-path>
+    --output <output-path> \
+    [--template <cpu-template>] \
+    [--config <firecracker-config>]
 ```
 
 Keeping the underlying hardware and software stack updated is essential for
 maintaining security and leveraging new technologies. On the other hand, since
 the guest CPU configuration can vary depending on the infrastructure, updating
-it could lead to a situation where a custom CPU template loses its validity.
-In addition, even if values of the guest CPU configuration don't change, its
+it could lead to a situation where a custom CPU template loses its validity. In
+addition, even if values of the guest CPU configuration don't change, its
 internal behavior or semantics could still change. For instance, a kernel
 version update may introduce changes to KVM emulation and a microcode update may
 alter the behavior of CPU instructions.
@@ -156,34 +160,33 @@ CPU features to a heterogeneous fleet consisting of multiple CPU models.
    template.
 1. Run the `cpu-template-helper template verify` command to check the created
    custom CPU template is applied correctly.
-1. Conduct thorough testing of the template as needed to ensure that it does
-   not contain any inconsistent entries and does not lead to guest crashes.
+1. Conduct thorough testing of the template as needed to ensure that it does not
+   contain any inconsistent entries and does not lead to guest crashes.
 
 ### Custom CPU template management
 
-1. Run the `cpu-template-helper fingerprint dump` command on each CPU model
-   at the same time when creating a custom CPU template.
+1. Run the `cpu-template-helper fingerprint dump` command on each CPU model at
+   the same time when creating a custom CPU template.
 1. Store the dumped fingerprint files together with the custom CPU template.
 1. Run the `cpu-template-helper fingerprint dump` command to ensure the
    template's validity whenever you expect changes to the underlying hardware
    and software stack.
-1. Run the `cpu-template-helper fingerprint compare` command to identify
-   changes of the underlying environment introduced after creating the template.
+1. Run the `cpu-template-helper fingerprint compare` command to identify changes
+   of the underlying environment introduced after creating the template.
 1. (if changes are detected) Review the identified changes, make necessary
    revisions to the CPU template, and replace the fingerprint file with the new
    one.
 
-> **Note**
-It is recommended to review the update process of the underlying stack on
-your infrastructure. This can help identify points that may require the above
-validation check.
+> **Note** It is recommended to review the update process of the underlying
+> stack on your infrastructure. This can help identify points that may require
+> the above validation check.
 
 ## Appendix
 
 ### MSRs excluded from guest CPU configuration dump
 
 | Register name                           | Index                   |
-|-----------------------------------------|-------------------------|
+| --------------------------------------- | ----------------------- |
 | MSR_IA32_TSC                            | 0x00000010              |
 | MSR_ARCH_PERFMON_PERFCTRn               | 0x000000c1 - 0x000000d2 |
 | MSR_ARCH_PERFMON_EVENTSELn              | 0x00000186 - 0x00000197 |
@@ -233,10 +236,11 @@ validation check.
 | HV_X64_MSR_SYNDBG_RECV_BUFFER           | 0x400000f4              |
 | HV_X64_MSR_SYNDBG_PENDING_BUFFER        | 0x400000f5              |
 | HV_X64_MSR_SYNDBG_OPTIONS               | 0x400000ff              |
+| HV_X64_MSR_TSC_INVARIANT_CONTROL        | 0x40000118              |
 
 ### ARM registers excluded from guest CPU configuration dump
 
-| Register name        | ID                 |
-|----------------------|--------------------|
-| Program Counter      | 0x6030000000100040 |
-| KVM_REG_ARM_TIMER_CNT| 0x603000000013df1a |
+| Register name         | ID                 |
+| --------------------- | ------------------ |
+| Program Counter       | 0x6030000000100040 |
+| KVM_REG_ARM_TIMER_CNT | 0x603000000013df1a |
